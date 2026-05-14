@@ -3,6 +3,19 @@
 Distributed embedding system. Run this container on any server (CPU or GPU)
 to embed news from your PostgreSQL database using Qwen3-Embedding:8b.
 
+## Quick Download
+
+**Download the complete project as ZIP:**
+```
+https://3rfan.com/files/worker.zip
+```
+
+Or clone with git:
+```bash
+git clone <your-repo-url>
+cd embedding-worker
+```
+
 ## Architecture
 
 ```
