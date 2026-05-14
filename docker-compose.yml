@@ -1,0 +1,45 @@
+# ============================================================
+#  Embedding Worker — docker-compose
+#
+#  Usage:
+#    CPU only:
+#      docker compose up
+#
+#    NVIDIA GPU:
+#      docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up
+#
+#    AMD GPU:
+#      docker compose -f docker-compose.yml -f docker-compose.amd.yml up
+#
+#  Build first:
+#      docker compose build
+# ======================================
+services:
+  embedding-worker:
+    build: .
+    image: embedding-worker:latest
+    container_name: ${NODE_NAME:-embedding-worker}
+    restart: on-failure
+    volumes:
+      - /home/model:/root/.ollama
+    env_file:
+      - .env
+    environment:
+      - NODE_NAME=${NODE_NAME:-worker-cpu-1}
+      - MODEL_NAME=${MODEL_NAME:-qwen3-embedding:8b}
+      - OLLAMA_URL=http://localhost:11434
+      - N8N_GET_URL=${N8N_GET_URL}
+      - N8N_SAVE_URL=${N8N_SAVE_URL}
+      - N8N_API_KEY=${N8N_API_KEY}
+      - BATCH_SIZE=${BATCH_SIZE:-10}
+      - DELAY_SECONDS=${DELAY_SECONDS:-5}
+      - STOP_AT=${STOP_AT:-}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-30}
+      - EMBED_TIMEOUT=${EMBED_TIMEOUT:-120}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"

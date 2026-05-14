@@ -1,0 +1,13 @@
+# AMD GPU (ROCm) override
+# Usage: docker compose -f docker-compose.yml -f docker-compose.amd.yml up
+
+services:
+  embedding-worker:
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+    environment:
+      - HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION:-}   # e.g. 11.0.0 for gfx1150

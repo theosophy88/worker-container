@@ -1,0 +1,12 @@
+# NVIDIA GPU override
+# Usage: docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up
+
+services:
+  embedding-worker:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
