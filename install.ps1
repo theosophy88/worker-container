@@ -104,8 +104,8 @@ Clear-Host
 Write-Host ""
 Write-Host "  ╔════════════════════════════════════════════════════════╗" -ForegroundColor Blue
 Write-Host "  ║     EMBEDDING WORKER — Windows Installer               ║" -ForegroundColor Blue
-Write-Host "  ║     Ollama · llama.cpp · Qwen3-Embedding:8b            ║" -ForegroundColor Blue
-Write-Host "  ║     CPU only  |  GPU only  |  Mixed CPU+GPU            ║" -ForegroundColor Blue
+Write-Host "  ║     HuggingFace · sentence-transformers                ║" -ForegroundColor Blue
+Write-Host "  ║     Qwen/Qwen3-Embedding-8B  |  float16/8bit/4bit      ║" -ForegroundColor Blue
 Write-Host "  ╚════════════════════════════════════════════════════════╝" -ForegroundColor Blue
 Write-Host ""
 
@@ -327,55 +327,66 @@ if (-not $Reconfigure) {
 }
 
 # ── Compute mode ──────────────────────────────────────────────────────────────
-Write-Header "Compute Mode — Ollama / llama.cpp"
+Write-Header "Compute Mode — HuggingFace / sentence-transformers"
 Write-Host ""
-Write-Host "  Ollama runs on llama.cpp and supports three modes:" -ForegroundColor White
+Write-Host "  Device auto-detected at runtime (CUDA -> ROCm -> MPS -> CPU)." -ForegroundColor White
+Write-Host "  Choose the precision mode that fits your hardware:" -ForegroundColor White
 Write-Host ""
-Write-Host "    [1]  CPU only    — pure CPU inference (works everywhere, slower)"
-Write-Host "    [2]  GPU only    — all layers in GPU VRAM (fastest, needs >=6 GB VRAM)"
-Write-Host "    [3]  Mixed       — split: N layers on GPU, rest on CPU"
-Write-Host "                       Use when: GPU VRAM < model size (~5.5 GB)"
-Write-Host ""
-Write-Host "  Qwen3-Embedding:8b: ~32 transformer layers, ~5.5 GB total" -ForegroundColor DarkGray
-Write-Host "    4 GB GPU → ~20 GPU layers    8 GB GPU → all 32 layers"  -ForegroundColor DarkGray
+Write-Host "    [1]  CPU float32   — pure CPU inference; works everywhere; slowest"
+Write-Host "                         Qwen3-Embedding-8B needs >=32 GB RAM"
+Write-Host "    [2]  GPU float16   — half precision; fastest GPU mode"
+Write-Host "                         Needs >=16 GB VRAM"
+Write-Host "    [3]  GPU 8-bit     — quantised; balanced speed vs. memory"
+Write-Host "                         Needs >=8 GB VRAM; requires bitsandbytes"
+Write-Host "    [4]  GPU 4-bit     — quantised; most memory-efficient"
+Write-Host "                         Needs >=4 GB VRAM; requires bitsandbytes"
 Write-Host ""
 
 $computeChoice = Prompt-Input "Compute mode" "1"
 $COMPUTE_MODE  = "cpu"
 $GPU_TYPE      = ""
-$GPU_LAYERS    = "0"
-$CPU_THREADS   = [Environment]::ProcessorCount
+$PRECISION     = "float32"
 $HSA_OVERRIDE  = ""
 
 switch ($computeChoice) {
     "1" {
         $COMPUTE_MODE = "cpu"
-        $CPU_THREADS  = Prompt-Input "CPU threads" "$([Environment]::ProcessorCount)"
-        $GPU_LAYERS   = "0"
+        $PRECISION    = "float32"
     }
     "2" {
         $COMPUTE_MODE = "gpu"
-        $GPU_LAYERS   = "999"
-        Write-Host "    [1] NVIDIA (CUDA)   [2] AMD (ROCm)" -ForegroundColor Gray
-        $gt = Prompt-Input "GPU type" "1"
-        $GPU_TYPE = if ($gt -eq "2") { "amd" } else { "nvidia" }
-        $CPU_THREADS = Prompt-Input "CPU threads for tokeniser/sampling" "4"
-    }
-    "3" {
-        $COMPUTE_MODE = "mixed"
+        $PRECISION    = "float16"
         Write-Host "    [1] NVIDIA (CUDA)   [2] AMD (ROCm)" -ForegroundColor Gray
         $gt = Prompt-Input "GPU type" "1"
         $GPU_TYPE = if ($gt -eq "2") { "amd" } else { "nvidia" }
         if ($GPU_TYPE -eq "amd") {
             $HSA_OVERRIDE = Prompt-Input "HSA_OVERRIDE_GFX_VERSION (e.g. 11.0.0, blank to skip)" ""
         }
-        $GPU_LAYERS  = Prompt-Input "GPU layers to offload (1-32)" "20"
-        $CPU_THREADS = Prompt-Input "CPU threads for remaining layers" "$([Environment]::ProcessorCount)"
+    }
+    "3" {
+        $COMPUTE_MODE = "gpu"
+        $PRECISION    = "8bit"
+        Write-Host "    [1] NVIDIA (CUDA)   [2] AMD (ROCm)" -ForegroundColor Gray
+        $gt = Prompt-Input "GPU type" "1"
+        $GPU_TYPE = if ($gt -eq "2") { "amd" } else { "nvidia" }
+        if ($GPU_TYPE -eq "amd") {
+            $HSA_OVERRIDE = Prompt-Input "HSA_OVERRIDE_GFX_VERSION (e.g. 11.0.0, blank to skip)" ""
+        }
+    }
+    "4" {
+        $COMPUTE_MODE = "gpu"
+        $PRECISION    = "4bit"
+        Write-Host "    [1] NVIDIA (CUDA)   [2] AMD (ROCm)" -ForegroundColor Gray
+        $gt = Prompt-Input "GPU type" "1"
+        $GPU_TYPE = if ($gt -eq "2") { "amd" } else { "nvidia" }
+        if ($GPU_TYPE -eq "amd") {
+            $HSA_OVERRIDE = Prompt-Input "HSA_OVERRIDE_GFX_VERSION (e.g. 11.0.0, blank to skip)" ""
+        }
     }
     default { Write-Err "Invalid choice"; exit 1 }
 }
 
-Write-Ok "Compute: $COMPUTE_MODE | GPU layers: $GPU_LAYERS | CPU threads: $CPU_THREADS"
+Write-Ok "Compute: $COMPUTE_MODE | Precision: $PRECISION"
 
 # ── Worker configuration ───────────────────────────────────────────────────────
 Write-Header "Worker Configuration"
@@ -389,10 +400,19 @@ $N8N_GET_URL   = Prompt-Input "  GET batch URL" `
 $N8N_SAVE_URL  = Prompt-Input "  SAVE vectors URL" `
     "https://n8n.3rfan.ir/webhook/4f1d52bf-25d5-4e0b-ab30-123f680d0255"
 $N8N_API_KEY   = Prompt-Input "  API Key" "123"
-$MODEL_NAME    = Prompt-Input "Model name" "qwen3-embedding:8b"
+Write-Host ""
+Write-Host "  Status reporting — optional heartbeat POST to n8n:" -ForegroundColor White
+Write-Host "  Leave blank to disable." -ForegroundColor DarkGray
+$N8N_STATUS_URL  = Prompt-Input "  STATUS webhook URL" ""
+$STATUS_INTERVAL = "10"
+if ($N8N_STATUS_URL -ne "") {
+    $STATUS_INTERVAL = Prompt-Input "  Report status every N cycles" "10"
+}
+Write-Host ""
+$HF_MODEL_NAME = Prompt-Input "HuggingFace model name" "Qwen/Qwen3-Embedding-8B"
 
-$defaultBatch  = if ($COMPUTE_MODE -eq "gpu") { "20" } elseif ($COMPUTE_MODE -eq "mixed") { "10" } else { "2" }
-Write-Host "  Recommended: CPU=2-5  Mixed=5-15  GPU=10-50" -ForegroundColor DarkGray
+$defaultBatch  = if ($COMPUTE_MODE -eq "cpu") { "2" } else { "10" }
+Write-Host "  Recommended: CPU=2-5  GPU=10-50" -ForegroundColor DarkGray
 $BATCH_SIZE    = Prompt-Input "Batch size" $defaultBatch
 $DELAY_SECS    = Prompt-Input "Delay between cycles (seconds)" "5"
 Write-Host "  Examples: 30m  8h  1d  1d-5h-30m  (blank = run forever)" -ForegroundColor DarkGray
@@ -405,30 +425,34 @@ $restartPolicy = if ($STOP_AT -ne "") { "on-failure" } else { "always" }
 $envContent = @"
 # Embedding Worker — generated by install.ps1 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 
+# -- Identity -----------------------------------------------------------------
 NODE_NAME=$NODE_NAME
 
+# -- n8n Webhooks -------------------------------------------------------------
 N8N_GET_URL=$N8N_GET_URL
 N8N_SAVE_URL=$N8N_SAVE_URL
 N8N_API_KEY=$N8N_API_KEY
+N8N_STATUS_URL=$N8N_STATUS_URL
+STATUS_INTERVAL=$STATUS_INTERVAL
 
-MODEL_NAME=$MODEL_NAME
-OLLAMA_URL=http://localhost:11434
+# -- Model (HuggingFace) ------------------------------------------------------
+HF_MODEL_NAME=$HF_MODEL_NAME
+HF_HOME=/root/.cache/huggingface
 
+# -- Precision / compute ------------------------------------------------------
+# PRECISION: float16 | float32 | 8bit | 4bit
+PRECISION=$PRECISION
+COMPUTE_MODE=$COMPUTE_MODE
+GPU_TYPE=$GPU_TYPE
+# AMD GPU compatibility override (leave blank for NVIDIA or pure CPU)
+HSA_OVERRIDE_GFX_VERSION=$HSA_OVERRIDE
+
+# -- Batch / timing -----------------------------------------------------------
 BATCH_SIZE=$BATCH_SIZE
 DELAY_SECONDS=$DELAY_SECS
 STOP_AT=$STOP_AT
-EMBED_TIMEOUT=3000
 REQUEST_TIMEOUT=30
 RESTART_POLICY=$restartPolicy
-
-# Compute (Ollama / llama.cpp)
-COMPUTE_MODE=$COMPUTE_MODE
-GPU_TYPE=$GPU_TYPE
-OLLAMA_NUM_GPU=$GPU_LAYERS
-OLLAMA_NUM_THREAD=$CPU_THREADS
-GPU_LAYERS=$GPU_LAYERS
-CPU_THREADS=$CPU_THREADS
-HSA_OVERRIDE_GFX_VERSION=$HSA_OVERRIDE
 "@
 
 $envPath = Join-Path $ScriptDir ".env"
@@ -461,7 +485,7 @@ if ($COMPUTE_MODE -ne "cpu") {
     }
 }
 
-Write-Info "Building image (first run downloads ~5 GB model)..."
+Write-Info "Building image (first run downloads model from HuggingFace — may take 10-30 min)..."
 & docker compose @composeArgs build
 if ($LASTEXITCODE -ne 0) { Write-Err "Build failed — check output above"; exit 1 }
 

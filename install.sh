@@ -570,15 +570,17 @@ create_worker_files() {
 
     # ── Dockerfile ────────────────────────────────────────────────────────────
     cat > "${WORKER_DIR}/Dockerfile" <<'DOCKERFILE'
-FROM ollama/ollama:latest
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3 python3-pip curl && \
-    rm -rf /var/lib/apt/lists/*
-RUN pip3 install requests --break-system-packages
-COPY entrypoint.sh /entrypoint.sh
-COPY worker.py     /worker.py
-RUN chmod +x /entrypoint.sh
-ENTRYPOINT ["/entrypoint.sh"]
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl git && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir \
+    torch sentence-transformers accelerate bitsandbytes requests
+ENV HF_HOME=/root/.cache/huggingface
+WORKDIR /app
+COPY worker.py .
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
+ENTRYPOINT ["/app/entrypoint.sh"]
 DOCKERFILE
     ok "Dockerfile"
 
@@ -586,129 +588,211 @@ DOCKERFILE
     cat > "${WORKER_DIR}/entrypoint.sh" <<'ENTRYPT'
 #!/bin/bash
 set -e
-export OLLAMA_NUM_GPU="${OLLAMA_NUM_GPU:-0}"
-[ -n "${OLLAMA_NUM_THREAD}" ] && export OLLAMA_NUM_THREAD
-ollama serve &
-echo "[entrypoint] Waiting for Ollama..."
-for i in $(seq 1 60); do
-    curl -sf http://localhost:11434/api/tags > /dev/null 2>&1 && break
-    sleep 1
-done
-echo "[entrypoint] Ollama ready"
-MODEL="${MODEL_NAME:-qwen3-embedding:8b}"
-echo "[entrypoint] Pulling model: ${MODEL}"
-ollama pull "$MODEL"
-echo "[entrypoint] Starting worker"
-exec python3 /worker.py
+HF_MODEL="${HF_MODEL_NAME:-Qwen/Qwen3-Embedding-8B}"
+PRECISION="${PRECISION:-float16}"
+echo "========================================"
+echo "  Embedding Worker Starting"
+echo "  Node     : ${NODE_NAME:-worker}"
+echo "  Model    : $HF_MODEL"
+echo "  Precision: $PRECISION"
+echo "========================================"
+echo "[startup] Starting embedding worker..."
+exec python3 /app/worker.py
 ENTRYPT
     chmod +x "${WORKER_DIR}/entrypoint.sh"
     ok "entrypoint.sh"
 
     # ── worker.py ─────────────────────────────────────────────────────────────
     cat > "${WORKER_DIR}/worker.py" <<'WORKERPY'
-#!/usr/bin/env python3
-"""Embedding Worker — fetches records from n8n, embeds via Ollama, saves back."""
-import os, sys, time, signal, logging, requests
-from datetime import datetime, timedelta
+import os, sys, re, time, json, logging, signal
+from datetime import datetime, timedelta, timezone
+import requests
 
-NODE_NAME        = os.environ.get("NODE_NAME",         "worker-unknown")
-N8N_GET_URL      = os.environ.get("N8N_GET_URL",       "")
-N8N_SAVE_URL     = os.environ.get("N8N_SAVE_URL",      "")
-N8N_API_KEY      = os.environ.get("N8N_API_KEY",       "")
-MODEL_NAME       = os.environ.get("MODEL_NAME",        "qwen3-embedding:8b")
-OLLAMA_URL       = os.environ.get("OLLAMA_URL",        "http://localhost:11434")
-BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",    "2"))
-DELAY_SECONDS    = int(os.environ.get("DELAY_SECONDS", "5"))
-STOP_AT          = os.environ.get("STOP_AT",           "")
-EMBED_TIMEOUT    = int(os.environ.get("EMBED_TIMEOUT", "3000"))
-REQUEST_TIMEOUT  = int(os.environ.get("REQUEST_TIMEOUT","30"))
-OLLAMA_NUM_GPU   = os.environ.get("OLLAMA_NUM_GPU",    "0")
-OLLAMA_NUM_THREAD= os.environ.get("OLLAMA_NUM_THREAD", "")
-HEADERS = {"X-API-Key": N8N_API_KEY, "Content-Type": "application/json"}
+total_embedded = 0; total_errors = 0; total_fetched = 0; _start_time = time.time()
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S", stream=sys.stdout)
-log = logging.getLogger(__name__)
+def require_env(k):
+    v = os.getenv(k)
+    if not v: print(f"ERROR: {k} is required"); sys.exit(1)
+    return v
+
+N8N_GET_URL     = require_env("N8N_GET_URL")
+N8N_SAVE_URL    = require_env("N8N_SAVE_URL")
+N8N_API_KEY     = require_env("N8N_API_KEY")
+NODE_NAME       = require_env("NODE_NAME")
+HF_MODEL_NAME   = os.getenv("HF_MODEL_NAME",   "Qwen/Qwen3-Embedding-8B")
+PRECISION       = os.getenv("PRECISION",        "float16").strip().lower()
+BATCH_SIZE      = int(os.getenv("BATCH_SIZE",      "10"))
+DELAY_SECONDS   = float(os.getenv("DELAY_SECONDS",   "5"))
+STOP_AT         = os.getenv("STOP_AT",          "").strip()
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+N8N_STATUS_URL  = os.getenv("N8N_STATUS_URL",  "").strip()
+STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", "10"))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
+                    handlers=[logging.StreamHandler(sys.stdout)])
+log = logging.getLogger("worker")
 
 _shutdown = False
 def _sig(sig, frame):
     global _shutdown
-    log.info("Signal received — finishing current batch then stopping...")
+    log.info(f"Signal {sig} received — shutting down after current batch...")
     _shutdown = True
-signal.signal(signal.SIGTERM, _sig)
-signal.signal(signal.SIGINT,  _sig)
+signal.signal(signal.SIGTERM, _sig); signal.signal(signal.SIGINT, _sig)
 
-def _parse_stop_at(s):
-    if not s: return None
-    secs = 0
-    for p in s.lower().replace("-"," ").split():
-        if p.endswith("d"): secs += int(p[:-1])*86400
-        elif p.endswith("h"): secs += int(p[:-1])*3600
-        elif p.endswith("m"): secs += int(p[:-1])*60
-    return datetime.now() + timedelta(seconds=secs) if secs else None
+def parse_duration(raw):
+    raw = raw.strip()
+    if not raw: return None
+    pat = re.compile(r'^(\d+)(d|h|m)$', re.I)
+    days = hours = minutes = 0
+    for p in raw.split('-'):
+        m = pat.match(p.strip())
+        if not m: log.error(f"Invalid STOP_AT part: '{p}'"); sys.exit(1)
+        v, u = int(m.group(1)), m.group(2).lower()
+        if u == 'd': days += v
+        elif u == 'h': hours += v
+        elif u == 'm': minutes += v
+    td = timedelta(days=days, hours=hours, minutes=minutes)
+    if td.total_seconds() <= 0: log.error("STOP_AT must be > 0"); sys.exit(1)
+    return td
 
-def _embed(text):
-    opts = {}
-    try: opts["num_gpu"] = int(OLLAMA_NUM_GPU)
-    except: pass
-    if OLLAMA_NUM_THREAD:
-        try: opts["num_thread"] = int(OLLAMA_NUM_THREAD)
-        except: pass
-    payload = {"model": MODEL_NAME, "input": text}
-    if opts: payload["options"] = opts
-    r = requests.post(f"{OLLAMA_URL}/api/embed", json=payload, timeout=EMBED_TIMEOUT)
-    r.raise_for_status()
-    return r.json()["embeddings"][0]
+def calc_stop_time(raw):
+    td = parse_duration(raw)
+    return datetime.now(timezone.utc) + td if td else None
 
-def _get_batch():
-    r = requests.post(N8N_GET_URL,
-                      json={"batch_size": BATCH_SIZE, "node_name": NODE_NAME},
-                      headers=HEADERS, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    return r.json().get("records", [])
+def format_duration(td):
+    s = int(td.total_seconds())
+    d, h, m = s//86400, (s%86400)//3600, (s%3600)//60
+    parts = ([f"{d}d"] if d else []) + ([f"{h}h"] if h else []) + ([f"{m}m"] if m else [])
+    return "-".join(parts) if parts else "0m"
 
-def _save(vectors):
-    r = requests.post(N8N_SAVE_URL, json={"vectors": vectors},
-                      headers=HEADERS, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    return r.json().get("saved", len(vectors))
+def should_stop(stop_at):
+    if _shutdown: return True
+    if stop_at and datetime.now(timezone.utc) >= stop_at:
+        log.info("Stop time reached."); return True
+    return False
+
+def detect_device():
+    import torch
+    if torch.cuda.is_available():
+        log.info(f"GPU: {torch.cuda.get_device_name(0)}"); return "cuda"
+    try:
+        if torch.backends.mps.is_available(): log.info("Apple MPS detected"); return "mps"
+    except AttributeError: pass
+    log.info("No GPU — using CPU"); return "cpu"
+
+def load_model(device):
+    import torch
+    from sentence_transformers import SentenceTransformer
+    kw = {}
+    if PRECISION == "float16": kw["torch_dtype"] = torch.float16
+    elif PRECISION == "float32": kw["torch_dtype"] = torch.float32
+    elif PRECISION == "8bit": kw["load_in_8bit"] = True
+    elif PRECISION == "4bit": kw["load_in_4bit"] = True
+    else: log.warning(f"Unknown PRECISION '{PRECISION}' — using float16"); kw["torch_dtype"] = torch.float16
+    if PRECISION in ("8bit","4bit") and device == "cpu":
+        log.warning(f"{PRECISION} not supported on CPU — using float32"); kw = {"torch_dtype": torch.float32}
+    log.info(f"Loading '{HF_MODEL_NAME}' (precision={PRECISION}, device={device})...")
+    model = SentenceTransformer(HF_MODEL_NAME, device=device, model_kwargs=kw)
+    log.info("Model loaded."); return model
+
+HEADERS = {"X-API-Key": N8N_API_KEY, "Content-Type": "application/json"}
+
+def fetch_batch():
+    global total_fetched
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(N8N_GET_URL, json={"node_name": NODE_NAME, "batch_size": BATCH_SIZE},
+                              headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            recs = r.json().get("records", [])
+            if recs: total_fetched += len(recs); log.info(f"Fetched {len(recs)} records (total: {total_fetched})")
+            else: log.info("No pending records — waiting...")
+            return recs
+        except Exception as e:
+            log.error(f"n8n GET error (attempt {attempt}/3): {e}")
+            if attempt < 3: log.info("Retrying in 1 minute..."); time.sleep(60)
+    log.error("Failed to fetch after 3 attempts"); return []
+
+def save_vectors(vectors):
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(N8N_SAVE_URL, json={"node_name": NODE_NAME, "vectors": vectors},
+                              headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            log.info(f"Saved {r.json().get('saved', len(vectors))}/{len(vectors)} vectors"); return True
+        except Exception as e:
+            log.error(f"n8n SAVE error (attempt {attempt}/3): {e}")
+            if attempt < 3: log.info("Retrying in 1 minute..."); time.sleep(60)
+    log.error("Failed to save after 3 attempts"); return False
+
+def post_status(status, cycle, device):
+    if not N8N_STATUS_URL: return
+    try:
+        r = requests.post(N8N_STATUS_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT,
+                          json={"node_name": NODE_NAME, "status": status, "cycles": cycle,
+                                "articles_embedded": total_embedded, "device": device,
+                                "uptime_seconds": int(time.time()-_start_time), "model_name": HF_MODEL_NAME})
+        r.raise_for_status()
+        log.info(f"Status posted: {status} (cycle={cycle}, embedded={total_embedded})")
+    except Exception as e:
+        log.warning(f"Status POST failed (non-fatal): {e}")
+
+def embed_batch(model, records):
+    global total_embedded, total_errors
+    results = []
+    for i, rec in enumerate(records):
+        nid = rec.get("id"); desc = rec.get("description", "")
+        if not desc or not str(desc).strip():
+            log.warning(f"Record {nid} empty — skipping"); total_errors += 1; continue
+        log.info(f"Embedding record {nid} ({i+1}/{len(records)}) ...")
+        try:
+            vec = model.encode(str(desc).strip(), normalize_embeddings=True).tolist()
+            total_embedded += 1
+            results.append({"id": nid, "vector": vec, "status": "done", "node_name": NODE_NAME})
+            log.info(f"Record {nid} — embedded ({len(vec)} dims)")
+        except Exception as e:
+            log.error(f"Embed error for {nid}: {e}"); total_errors += 1
+            results.append({"id": nid, "status": "AI-error", "node_name": NODE_NAME})
+    if total_embedded > 0 and total_embedded % 10 == 0:
+        log.info(f"[STATS] Total: {total_embedded} embedded, {total_errors} errors")
+    return results
 
 def main():
-    deadline = _parse_stop_at(STOP_AT)
-    if deadline: log.info(f"Auto-stop at {deadline:%Y-%m-%d %H:%M:%S} ({STOP_AT})")
-    log.info(f"Worker started — node={NODE_NAME} model={MODEL_NAME} "
-             f"batch={BATCH_SIZE} delay={DELAY_SECONDS}s "
-             f"gpu_layers={OLLAMA_NUM_GPU} cpu_threads={OLLAMA_NUM_THREAD or 'auto'}")
-    cycle = 0; total = 0
-    while not _shutdown:
-        if deadline and datetime.now() >= deadline:
-            log.info(f"Stop deadline reached ({STOP_AT})"); break
-        cycle += 1
-        try:
-            records = _get_batch()
-            if not records:
-                log.info(f"Cycle {cycle}: no pending records — sleeping {DELAY_SECONDS}s")
-                time.sleep(DELAY_SECONDS); continue
-            log.info(f"Cycle {cycle}: processing {len(records)} records")
-            t0 = time.time(); vectors = []
-            for rec in records:
-                rid  = rec["id"]
-                text = (rec.get("description") or rec.get("text") or "").strip()
-                if not text: log.warning(f"  id={rid}: empty — skipping"); continue
-                try:
-                    vectors.append({"id": rid, "vector": _embed(text), "node_name": NODE_NAME})
-                except Exception as e:
-                    log.error(f"  id={rid}: embed failed — {e}")
-            if vectors:
-                saved = _save(vectors); total += saved
-                log.info(f"Cycle {cycle}: saved {saved} in {time.time()-t0:.1f}s (total: {total})")
-        except requests.RequestException as e:
-            log.error(f"Cycle {cycle}: network error — {e}")
-        except Exception as e:
-            log.error(f"Cycle {cycle}: error — {e}")
-        if not _shutdown: time.sleep(DELAY_SECONDS)
-    log.info(f"Stopped. Session total: {total} embedded.")
-    sys.exit(0)
+    device = detect_device()
+    model  = load_model(device)
+    log.info("Running test embedding...")
+    try:
+        tv = model.encode("test", normalize_embeddings=True)
+        log.info(f"Test embedding OK — {len(tv)} dimensions")
+    except Exception as e:
+        log.error(f"Test embedding failed: {e}"); sys.exit(1)
+    stop_at = calc_stop_time(STOP_AT)
+    dur_str = format_duration(parse_duration(STOP_AT)) if STOP_AT else "forever"
+    log.info("="*52)
+    log.info(f"  Node: {NODE_NAME}  Model: {HF_MODEL_NAME}  Precision: {PRECISION}  Device: {device}")
+    log.info(f"  Batch: {BATCH_SIZE}  Delay: {DELAY_SECONDS}s  Run for: {dur_str}")
+    if N8N_STATUS_URL: log.info(f"  Status every {STATUS_INTERVAL} cycles → {N8N_STATUS_URL}")
+    log.info("="*52)
+    cycle = 0
+    try:
+        while not should_stop(stop_at):
+            cycle += 1
+            if stop_at:
+                rem = stop_at - datetime.now(timezone.utc)
+                log.info(f"── Cycle {cycle}  (remaining: {format_duration(rem) if rem.total_seconds()>0 else '0m'}) ──")
+            else:
+                log.info(f"── Cycle {cycle} ──────────────────────────────────")
+            records = fetch_batch()
+            if not records: time.sleep(DELAY_SECONDS); continue
+            vectors = embed_batch(model, records)
+            if not vectors: time.sleep(DELAY_SECONDS); continue
+            save_vectors(vectors)
+            if N8N_STATUS_URL and STATUS_INTERVAL > 0 and cycle % STATUS_INTERVAL == 0:
+                post_status("running", cycle, device)
+            if not should_stop(stop_at): time.sleep(DELAY_SECONDS)
+    finally:
+        post_status("stopped", cycle, device)
+        log.info(f"Worker stopped. Total: {total_embedded} embedded, {total_errors} errors.")
 
 if __name__ == "__main__":
     main()
@@ -721,24 +805,23 @@ services:
   embedding-worker:
     container_name: embedding-worker
     build: .
-    restart: "${RESTART_POLICY:-always}"
+    restart: "${RESTART_POLICY:-on-failure}"
     volumes:
-      - /home/model:/root/.ollama
+      - /home/model:/root/.cache/huggingface
     environment:
       - NODE_NAME=${NODE_NAME}
+      - HF_MODEL_NAME=${HF_MODEL_NAME:-Qwen/Qwen3-Embedding-8B}
+      - HF_HOME=/root/.cache/huggingface
+      - PRECISION=${PRECISION:-float16}
       - N8N_GET_URL=${N8N_GET_URL}
       - N8N_SAVE_URL=${N8N_SAVE_URL}
       - N8N_API_KEY=${N8N_API_KEY}
-      - MODEL_NAME=${MODEL_NAME:-qwen3-embedding:8b}
-      - OLLAMA_URL=${OLLAMA_URL:-http://localhost:11434}
-      - BATCH_SIZE=${BATCH_SIZE:-2}
+      - N8N_STATUS_URL=${N8N_STATUS_URL:-}
+      - STATUS_INTERVAL=${STATUS_INTERVAL:-10}
+      - BATCH_SIZE=${BATCH_SIZE:-10}
       - DELAY_SECONDS=${DELAY_SECONDS:-5}
       - STOP_AT=${STOP_AT:-}
-      - EMBED_TIMEOUT=${EMBED_TIMEOUT:-3000}
       - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-30}
-      - OLLAMA_NUM_GPU=${OLLAMA_NUM_GPU:-0}
-      - OLLAMA_NUM_THREAD=${OLLAMA_NUM_THREAD:-}
-      - HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION:-}
 DCOMPOSE
     ok "docker-compose.yml"
 
@@ -776,67 +859,59 @@ DCAMD
     info "Install path: ${WORKER_DIR}"
 }
 
-# ── Compute/performance configuration ─────────────────────────────────────────
-# NOTE: Ollama is built on llama.cpp, so it supports the same layer-split
-# between GPU VRAM and CPU RAM. "Mixed" mode means N transformer layers run
-# on GPU and the remainder run on CPU threads — useful when GPU VRAM < model
-# size (~5.5 GB for Qwen3-Embedding:8b which has ~32 transformer layers).
-#
-# Control variables:
-#   OLLAMA_NUM_GPU   — GPU layers to offload  (0 = CPU-only, 999 = all)
-#   OLLAMA_NUM_THREAD — CPU threads
+# ── Compute/precision configuration ───────────────────────────────────────────
+# HuggingFace sentence-transformers loads the full model in-process.
+# Device is auto-detected at runtime: CUDA → ROCm → MPS → CPU.
+# PRECISION controls memory vs. speed tradeoff for the 8B model:
+#   float16 — half precision  (≥16 GB VRAM)
+#   float32 — full precision  (CPU default; also works on GPU)
+#   8bit    — quantised GPU   (≥8 GB VRAM; requires bitsandbytes)
+#   4bit    — quantised GPU   (≥4 GB VRAM; requires bitsandbytes)
 # ──────────────────────────────────────────────────────────────────────────────
-COMPUTE_MODE="" GPU_TYPE="" GPU_LAYERS=0 CPU_THREADS=0 HSA_OVERRIDE=""
+COMPUTE_MODE="" GPU_TYPE="" PRECISION="float32" HSA_OVERRIDE=""
 
 configure_compute() {
-    hdr "Compute Mode — Ollama / llama.cpp"
+    hdr "Compute Mode — HuggingFace / sentence-transformers"
     echo ""
-    echo -e "  ${BOLD}Ollama uses llama.cpp and supports three modes:${NC}"
+    echo -e "  ${BOLD}Device auto-detected at runtime (CUDA → ROCm → MPS → CPU).${NC}"
+    echo -e "  ${BOLD}Choose the precision mode that fits your hardware:${NC}"
     echo ""
-    echo "    [1]  CPU only    — pure CPU inference; no GPU required; slower"
-    echo "    [2]  GPU only    — all layers in GPU VRAM; fastest; needs ≥6 GB VRAM"
-    echo "    [3]  Mixed       — split layers between GPU + CPU"
-    echo "                       GPU handles N layers, CPU handles the rest"
-    echo "                       Best when: GPU VRAM < model size (5.5 GB)"
-    echo ""
-    echo -e "  ${DIM}Qwen3-Embedding:8b: ~32 transformer layers, ~5.5 GB total${NC}"
-    echo -e "  ${DIM}  4 GB GPU → ~20 GPU layers + 12 CPU layers${NC}"
-    echo -e "  ${DIM}  8 GB GPU → all 32 GPU layers (= GPU only mode)${NC}"
+    echo "    [1]  CPU float32   — pure CPU inference; works everywhere; slowest"
+    echo "                         Qwen3-Embedding-8B needs ≥32 GB RAM"
+    echo "    [2]  GPU float16   — half precision; fastest GPU mode"
+    echo "                         Needs ≥16 GB VRAM"
+    echo "    [3]  GPU 8-bit     — quantised; balanced speed vs. memory"
+    echo "                         Needs ≥8 GB VRAM; requires bitsandbytes"
+    echo "    [4]  GPU 4-bit     — quantised; most memory-efficient"
+    echo "                         Needs ≥4 GB VRAM; requires bitsandbytes"
     echo ""
     ask "Compute mode" "1"
 
     case "$REPLY" in
         1)
             COMPUTE_MODE="cpu"
-            GPU_LAYERS=0
-            local total; total=$(nproc)
-            ask "CPU threads to allocate" "$total"
-            CPU_THREADS="$REPLY"
+            PRECISION="float32"
             ;;
         2)
             COMPUTE_MODE="gpu"
-            GPU_LAYERS=999   # offload all layers
+            PRECISION="float16"
             _ask_gpu_type
-            ask "CPU threads (for tokeniser/sampling, recommend 4)" "4"
-            CPU_THREADS="$REPLY"
             ;;
         3)
-            COMPUTE_MODE="mixed"
+            COMPUTE_MODE="gpu"
+            PRECISION="8bit"
             _ask_gpu_type
-            echo ""
-            echo -e "  ${BOLD}How many of the 32 layers to run on GPU?${NC}"
-            echo -e "  ${DIM}  4 GB VRAM  → try 16–20    8 GB VRAM → try 28–32${NC}"
-            ask "GPU layers (1–32)" "20"
-            GPU_LAYERS="$REPLY"
-            local total; total=$(nproc)
-            ask "CPU threads for remaining layers" "$total"
-            CPU_THREADS="$REPLY"
+            ;;
+        4)
+            COMPUTE_MODE="gpu"
+            PRECISION="4bit"
+            _ask_gpu_type
             ;;
         *)
             die "Invalid choice" ;;
     esac
 
-    ok "Compute: ${COMPUTE_MODE} | GPU layers: ${GPU_LAYERS} | CPU threads: ${CPU_THREADS}"
+    ok "Compute: ${COMPUTE_MODE} | Precision: ${PRECISION}"
 }
 
 _ask_gpu_type() {
@@ -859,8 +934,8 @@ _ask_gpu_type() {
 }
 
 # ── Worker Q&A ────────────────────────────────────────────────────────────────
-NODE_NAME="" N8N_GET_URL="" N8N_SAVE_URL="" N8N_API_KEY=""
-MODEL_NAME="" BATCH_SIZE=2 DELAY_SECONDS=5 STOP_AT=""
+NODE_NAME="" N8N_GET_URL="" N8N_SAVE_URL="" N8N_API_KEY="" N8N_STATUS_URL=""
+HF_MODEL_NAME="" BATCH_SIZE=10 DELAY_SECONDS=5 STOP_AT="" STATUS_INTERVAL=10
 
 configure_worker() {
     hdr "Worker Configuration"
@@ -885,15 +960,24 @@ configure_worker() {
     N8N_API_KEY="$REPLY"
 
     echo ""
-    ask "Model name" "qwen3-embedding:8b"
-    MODEL_NAME="$REPLY"
+    echo -e "  ${BOLD}Status reporting — optional heartbeat POST to n8n:${NC}"
+    echo -e "  ${DIM}  Leave blank to disable${NC}"
+    ask "  STATUS webhook URL" ""
+    N8N_STATUS_URL="$REPLY"
+    if [[ -n "$N8N_STATUS_URL" ]]; then
+        ask "  Report status every N cycles" "10"
+        STATUS_INTERVAL="$REPLY"
+    fi
+
+    echo ""
+    ask "HuggingFace model name" "Qwen/Qwen3-Embedding-8B"
+    HF_MODEL_NAME="$REPLY"
 
     # Suggest batch size based on compute mode
-    local default_batch=2
-    [[ "$COMPUTE_MODE" == "gpu" ]]   && default_batch=20
-    [[ "$COMPUTE_MODE" == "mixed" ]] && default_batch=10
+    local default_batch=10
+    [[ "$COMPUTE_MODE" == "cpu" ]] && default_batch=2
     echo ""
-    echo -e "  ${DIM}Recommended batch size: CPU=2–5  Mixed=5–15  GPU=10–50${NC}"
+    echo -e "  ${DIM}Recommended batch size: CPU=2–5  GPU=10–50${NC}"
     ask "Batch size" "$default_batch"
     BATCH_SIZE="$REPLY"
 
@@ -923,8 +1007,8 @@ write_config() {
         exit 1
     fi
 
-    local restart_policy="always"
-    [[ -n "$STOP_AT" ]] && restart_policy="on-failure"
+    local restart_policy="on-failure"
+    [[ -z "$STOP_AT" ]] && restart_policy="always"
 
     cat > "${WORKER_DIR}/.env" <<EOF
 # Embedding Worker — generated by install.sh $(date '+%Y-%m-%d %H:%M:%S')
@@ -936,31 +1020,27 @@ NODE_NAME=${NODE_NAME}
 N8N_GET_URL=${N8N_GET_URL}
 N8N_SAVE_URL=${N8N_SAVE_URL}
 N8N_API_KEY=${N8N_API_KEY}
+N8N_STATUS_URL=${N8N_STATUS_URL}
+STATUS_INTERVAL=${STATUS_INTERVAL}
 
-# ── Model ─────────────────────────────────────────────────────────────────────
-MODEL_NAME=${MODEL_NAME}
-OLLAMA_URL=http://localhost:11434
+# ── Model (HuggingFace) ────────────────────────────────────────────────────────
+HF_MODEL_NAME=${HF_MODEL_NAME}
+HF_HOME=/root/.cache/huggingface
+
+# ── Precision / compute ───────────────────────────────────────────────────────
+# PRECISION: float16 | float32 | 8bit | 4bit
+PRECISION=${PRECISION}
+COMPUTE_MODE=${COMPUTE_MODE}
+GPU_TYPE=${GPU_TYPE}
+# AMD GPU compatibility override (leave blank for NVIDIA or pure CPU)
+HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE}
 
 # ── Batch / timing ────────────────────────────────────────────────────────────
 BATCH_SIZE=${BATCH_SIZE}
 DELAY_SECONDS=${DELAY_SECONDS}
 STOP_AT=${STOP_AT}
-EMBED_TIMEOUT=3000
 REQUEST_TIMEOUT=30
 RESTART_POLICY=${restart_policy}
-
-# ── Compute (Ollama / llama.cpp) ──────────────────────────────────────────────
-# COMPUTE_MODE: cpu | gpu | mixed
-COMPUTE_MODE=${COMPUTE_MODE}
-GPU_TYPE=${GPU_TYPE}
-# OLLAMA_NUM_GPU: layers to offload to GPU (0=CPU-only, 999=all layers)
-OLLAMA_NUM_GPU=${GPU_LAYERS}
-# OLLAMA_NUM_THREAD: CPU threads for inference
-OLLAMA_NUM_THREAD=${CPU_THREADS}
-GPU_LAYERS=${GPU_LAYERS}
-CPU_THREADS=${CPU_THREADS}
-# AMD GPU compatibility override (leave blank for NVIDIA or pure CPU)
-HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE}
 EOF
     ok ".env written to ${WORKER_DIR}/.env"
 
@@ -999,7 +1079,7 @@ build_and_start() {
         esac
     fi
 
-    info "Building image (first run downloads ~5 GB model — may take 10–30 min)..."
+    info "Building image (first run downloads model from HuggingFace — may take 10–30 min)..."
     if is_lxc || [[ "${DOCKER_BUILDKIT:-1}" == "0" ]]; then
         DOCKER_BUILDKIT=0 docker compose $compose_args build
     else
@@ -1163,8 +1243,8 @@ print_banner() {
     cat <<'BANNER'
   ╔═══════════════════════════════════════════════════════════╗
   ║       EMBEDDING WORKER — Universal Linux Installer        ║
-  ║       Ollama · llama.cpp · Qwen3-Embedding:8b             ║
-  ║       CPU only  |  GPU only  |  Mixed CPU+GPU             ║
+  ║       HuggingFace · sentence-transformers                 ║
+  ║       Qwen/Qwen3-Embedding-8B  |  float16/8bit/4bit       ║
   ║                                                           ║
   ║  Supported: Ubuntu · Debian · CentOS · RHEL · Fedora      ║
   ║             Rocky · Alma · Arch · openSUSE · Alpine        ║

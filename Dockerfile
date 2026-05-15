@@ -1,12 +1,17 @@
-FROM ollama/ollama:latest
+FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y \
-    python3 \
-    python3-pip \
-    curl \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl git \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install requests --break-system-packages
+RUN pip install --no-cache-dir \
+    torch \
+    sentence-transformers \
+    accelerate \
+    bitsandbytes \
+    requests
+
+ENV HF_HOME=/root/.cache/huggingface
 
 WORKDIR /app
 COPY worker.py .

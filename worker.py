@@ -3,7 +3,7 @@ Embedding Worker
 ================
 Loops forever (or until stop duration):
   1. Calls n8n GET webhook  → receives batch of {id, description}
-  2. Embeds each description via local Ollama
+  2. Embeds each description via local HuggingFace sentence-transformers model
   3. Calls n8n POST webhook → saves vectors back to DB
   4. Sleeps for DELAY_SECONDS
   5. Repeat
@@ -30,10 +30,11 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-# ── Global statistics ────────────────────────────────────────────────────────
+# ── Global statistics ─────────────────────────────────────────────────────────
 total_embedded = 0
-total_errors = 0
-total_fetched = 0
+total_errors   = 0
+total_fetched  = 0
+_start_time    = time.time()
 
 # ── Config from environment ───────────────────────────────────────────────────
 
@@ -49,13 +50,15 @@ N8N_SAVE_URL    = require_env("N8N_SAVE_URL")
 N8N_API_KEY     = require_env("N8N_API_KEY")
 NODE_NAME       = require_env("NODE_NAME")
 
-OLLAMA_URL      = os.getenv("OLLAMA_URL",      "http://localhost:11434")
-MODEL_NAME      = os.getenv("MODEL_NAME",      "qwen3-embedding:8b")
+HF_MODEL_NAME   = os.getenv("HF_MODEL_NAME",   "Qwen/Qwen3-Embedding-8B")
+PRECISION       = os.getenv("PRECISION",        "float16").strip().lower()
 BATCH_SIZE      = int(os.getenv("BATCH_SIZE",      "10"))
 DELAY_SECONDS   = float(os.getenv("DELAY_SECONDS",   "5"))
 STOP_AT         = os.getenv("STOP_AT", "").strip()
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
-EMBED_TIMEOUT   = int(os.getenv("EMBED_TIMEOUT",  "120"))
+
+N8N_STATUS_URL  = os.getenv("N8N_STATUS_URL",  "").strip()
+STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", "10"))
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -139,8 +142,7 @@ def calc_stop_time(raw: str) -> datetime | None:
     duration = parse_duration(raw)
     if duration is None:
         return None
-    stop_at = datetime.now(timezone.utc) + duration
-    return stop_at
+    return datetime.now(timezone.utc) + duration
 
 def format_duration(td: timedelta) -> str:
     """Format a timedelta as a human-readable string."""
@@ -161,6 +163,107 @@ def should_stop(stop_at: datetime | None) -> bool:
         log.info("Stop time reached. Shutting down.")
         return True
     return False
+
+# ── Device detection ──────────────────────────────────────────────────────────
+
+def detect_device() -> str:
+    """Auto-detect best available device: CUDA/ROCm → MPS → CPU."""
+    import torch
+    if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+        log.info(f"GPU detected: {name}")
+        return "cuda"
+    try:
+        if torch.backends.mps.is_available():
+            log.info("Apple MPS device detected")
+            return "mps"
+    except AttributeError:
+        pass
+    log.info("No GPU detected — using CPU")
+    return "cpu"
+
+# ── Model loading ─────────────────────────────────────────────────────────────
+
+def load_model(device: str):
+    """Load the sentence-transformers model with the configured precision."""
+    import torch
+    from sentence_transformers import SentenceTransformer
+
+    model_kwargs: dict = {}
+
+    if PRECISION == "float16":
+        model_kwargs["torch_dtype"] = torch.float16
+    elif PRECISION == "float32":
+        model_kwargs["torch_dtype"] = torch.float32
+    elif PRECISION == "8bit":
+        model_kwargs["load_in_8bit"] = True
+    elif PRECISION == "4bit":
+        model_kwargs["load_in_4bit"] = True
+    else:
+        log.warning(f"Unknown PRECISION '{PRECISION}' — defaulting to float16")
+        model_kwargs["torch_dtype"] = torch.float16
+
+    if PRECISION in ("8bit", "4bit") and device == "cpu":
+        log.warning(f"{PRECISION} quantization not supported on CPU — falling back to float32")
+        model_kwargs = {"torch_dtype": torch.float32}
+
+    log.info(f"Loading '{HF_MODEL_NAME}' (precision={PRECISION}, device={device})...")
+    model = SentenceTransformer(
+        HF_MODEL_NAME,
+        device=device,
+        model_kwargs=model_kwargs,
+    )
+    log.info("Model loaded.")
+    return model
+
+# ── Embedding ─────────────────────────────────────────────────────────────────
+
+def embed_text(model, text: str) -> list[float] | None:
+    try:
+        vec = model.encode(str(text).strip(), normalize_embeddings=True)
+        return vec.tolist()
+    except Exception as e:
+        log.error(f"Embed error: {e}")
+        return None
+
+def embed_batch(model, records: list[dict]) -> list[dict]:
+    global total_embedded, total_errors
+    results = []
+    for i, record in enumerate(records):
+        news_id     = record.get("id")
+        description = record.get("description", "")
+
+        if not description or not str(description).strip():
+            log.warning(f"Record {news_id} has empty description — skipping")
+            total_errors += 1
+            continue
+
+        log.info(f"Embedding record {news_id} ({i+1}/{len(records)}) ...")
+        vector = embed_text(model, str(description).strip())
+
+        if vector is None:
+            log.warning(f"Failed to embed record {news_id} — AI-error")
+            total_errors += 1
+            results.append({
+                "id":        news_id,
+                "status":    "AI-error",
+                "node_name": NODE_NAME,
+            })
+            continue
+
+        total_embedded += 1
+        results.append({
+            "id":        news_id,
+            "vector":    vector,
+            "status":    "done",
+            "node_name": NODE_NAME,
+        })
+        log.info(f"Record {news_id} — embedded ({len(vector)} dims)")
+
+    if total_embedded > 0 and total_embedded % 10 == 0:
+        log.info(f"[STATS] Total: {total_embedded} embedded, {total_errors} errors")
+
+    return results
 
 # ── n8n API calls ─────────────────────────────────────────────────────────────
 
@@ -231,74 +334,48 @@ def save_vectors(vectors: list[dict]) -> bool:
     log.error("Failed to save vectors after 3 attempts")
     return False
 
-# ── Ollama embedding ──────────────────────────────────────────────────────────
-
-def embed_text(text: str) -> list[float] | None:
+def post_status(status: str, cycle: int, device: str) -> None:
+    """POST worker heartbeat/status to n8n. Non-fatal if it fails."""
+    if not N8N_STATUS_URL:
+        return
+    payload = {
+        "node_name":         NODE_NAME,
+        "status":            status,
+        "cycles":            cycle,
+        "articles_embedded": total_embedded,
+        "device":            device,
+        "uptime_seconds":    int(time.time() - _start_time),
+        "model_name":        HF_MODEL_NAME,
+    }
     try:
         resp = requests.post(
-            f"{OLLAMA_URL}/api/embed",
-            json={"model": MODEL_NAME, "input": text},
-            timeout=EMBED_TIMEOUT,
+            N8N_STATUS_URL, json=payload,
+            headers=HEADERS, timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
-        embeddings = resp.json().get("embeddings")
-        if embeddings and len(embeddings) > 0:
-            return embeddings[0]
-        log.warning("Ollama returned empty embeddings")
-        return None
+        log.info(f"Status posted: {status} (cycle={cycle}, embedded={total_embedded})")
     except Exception as e:
-        log.error(f"Ollama embed error: {e}")
-        return None
-
-def embed_batch(records: list[dict]) -> list[dict]:
-    global total_embedded, total_errors
-    results = []
-    for i, record in enumerate(records):
-        news_id     = record.get("id")
-        description = record.get("description", "")
-
-        if not description or not str(description).strip():
-            log.warning(f"Record {news_id} has empty description — skipping")
-            total_errors += 1
-            continue
-
-        log.info(f"Embedding record {news_id} ({i+1}/{len(records)}) ...")
-        vector = embed_text(str(description).strip())
-
-        if vector is None:
-            log.warning(f"Failed to embed record {news_id} — AI-error")
-            total_errors += 1
-            results.append({
-                "id":        news_id,
-                "status":    "AI-error",
-                "node_name": NODE_NAME,
-            })
-            continue
-
-        total_embedded += 1
-        results.append({
-            "id":        news_id,
-            "vector":    vector,
-            "status":    "done",
-            "node_name": NODE_NAME,
-        })
-        log.info(f"Record {news_id} — embedded ({len(vector)} dims)")
-
-    # Log periodic stats
-    if total_embedded > 0 and total_embedded % 10 == 0:
-        log.info(f"[STATS] Total: {total_embedded} embedded, {total_errors} errors")
-
-    return results
+        log.warning(f"Status POST failed (non-fatal): {e}")
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
+    device = detect_device()
+    model  = load_model(device)
+
+    log.info("Running test embedding...")
+    try:
+        test_vec = model.encode("test", normalize_embeddings=True)
+        log.info(f"Test embedding OK — {len(test_vec)} dimensions")
+    except Exception as e:
+        log.error(f"Test embedding failed: {e}")
+        sys.exit(1)
+
     stop_at = calc_stop_time(STOP_AT)
 
-    # Human-readable stop time display
     if stop_at:
-        duration_str   = format_duration(parse_duration(STOP_AT))
-        stop_at_local  = stop_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        duration_str  = format_duration(parse_duration(STOP_AT))
+        stop_at_local = stop_at.strftime("%Y-%m-%d %H:%M:%S UTC")
     else:
         duration_str  = "∞ forever"
         stop_at_local = "never"
@@ -306,48 +383,57 @@ def main():
     log.info("=" * 52)
     log.info("  Embedding Worker")
     log.info(f"  Node name   : {NODE_NAME}")
-    log.info(f"  Model       : {MODEL_NAME}")
-    log.info(f"  Ollama      : {OLLAMA_URL}")
+    log.info(f"  Model       : {HF_MODEL_NAME}")
+    log.info(f"  Precision   : {PRECISION}")
+    log.info(f"  Device      : {device}")
     log.info(f"  Batch size  : {BATCH_SIZE}")
     log.info(f"  Delay       : {DELAY_SECONDS}s between cycles")
     log.info(f"  Run for     : {duration_str}")
     log.info(f"  Stop at     : {stop_at_local}")
+    if N8N_STATUS_URL:
+        log.info(f"  Status URL  : {N8N_STATUS_URL}")
+        log.info(f"  Status every: {STATUS_INTERVAL} cycles")
     log.info("=" * 52)
 
     cycle = 0
 
-    while not should_stop(stop_at):
-        cycle += 1
+    try:
+        while not should_stop(stop_at):
+            cycle += 1
 
-        # Show remaining time every cycle
-        if stop_at:
-            remaining = stop_at - datetime.now(timezone.utc)
-            remaining_str = format_duration(remaining) if remaining.total_seconds() > 0 else "0m"
-            log.info(f"── Cycle {cycle}  (time remaining: {remaining_str}) ──")
-        else:
-            log.info(f"── Cycle {cycle} ──────────────────────────────────")
+            if stop_at:
+                remaining = stop_at - datetime.now(timezone.utc)
+                remaining_str = format_duration(remaining) if remaining.total_seconds() > 0 else "0m"
+                log.info(f"── Cycle {cycle}  (time remaining: {remaining_str}) ──")
+            else:
+                log.info(f"── Cycle {cycle} ──────────────────────────────────")
 
-        records = fetch_batch()
+            records = fetch_batch()
 
-        if not records:
-            log.info("No pending records — waiting before retry...")
-            time.sleep(DELAY_SECONDS)
-            continue
+            if not records:
+                log.info("No pending records — waiting before retry...")
+                time.sleep(DELAY_SECONDS)
+                continue
 
-        vectors = embed_batch(records)
+            vectors = embed_batch(model, records)
 
-        if not vectors:
-            log.warning("No vectors produced this cycle — waiting...")
-            time.sleep(DELAY_SECONDS)
-            continue
+            if not vectors:
+                log.warning("No vectors produced this cycle — waiting...")
+                time.sleep(DELAY_SECONDS)
+                continue
 
-        save_vectors(vectors)
+            save_vectors(vectors)
 
-        if not should_stop(stop_at):
-            log.info(f"Waiting {DELAY_SECONDS}s before next cycle...")
-            time.sleep(DELAY_SECONDS)
+            if N8N_STATUS_URL and STATUS_INTERVAL > 0 and cycle % STATUS_INTERVAL == 0:
+                post_status("running", cycle, device)
 
-    log.info("Worker stopped cleanly.")
+            if not should_stop(stop_at):
+                log.info(f"Waiting {DELAY_SECONDS}s before next cycle...")
+                time.sleep(DELAY_SECONDS)
+
+    finally:
+        post_status("stopped", cycle, device)
+        log.info(f"Worker stopped. Session total: {total_embedded} embedded, {total_errors} errors.")
 
 if __name__ == "__main__":
     main()

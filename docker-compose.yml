@@ -21,21 +21,23 @@ services:
     container_name: ${NODE_NAME:-embedding-worker}
     restart: on-failure
     volumes:
-      - /home/model:/root/.ollama
+      - /home/model:/root/.cache/huggingface
     env_file:
       - .env
     environment:
       - NODE_NAME=${NODE_NAME:-worker-cpu-1}
-      - MODEL_NAME=${MODEL_NAME:-qwen3-embedding:8b}
-      - OLLAMA_URL=http://localhost:11434
+      - HF_MODEL_NAME=${HF_MODEL_NAME:-Qwen/Qwen3-Embedding-8B}
+      - HF_HOME=/root/.cache/huggingface
+      - PRECISION=${PRECISION:-float16}
       - N8N_GET_URL=${N8N_GET_URL}
       - N8N_SAVE_URL=${N8N_SAVE_URL}
       - N8N_API_KEY=${N8N_API_KEY}
+      - N8N_STATUS_URL=${N8N_STATUS_URL:-}
+      - STATUS_INTERVAL=${STATUS_INTERVAL:-10}
       - BATCH_SIZE=${BATCH_SIZE:-10}
       - DELAY_SECONDS=${DELAY_SECONDS:-5}
       - STOP_AT=${STOP_AT:-}
       - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-30}
-      - EMBED_TIMEOUT=${EMBED_TIMEOUT:-120}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     logging:
