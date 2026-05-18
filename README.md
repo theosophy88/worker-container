@@ -148,9 +148,11 @@ bash uninstall.sh
 
 Running either script will:
 - stop and remove the Docker Compose stack
+- force-stop and remove any remaining `embedding-worker` containers
 - remove the `embedding-worker:latest` image
 - delete generated `.env`
 - optionally remove the host model cache at `/home/model`
+- optionally remove the installed worker directory itself (the current repository/install path)
 
 Manual removal steps (if you do not use the uninstall script):
 

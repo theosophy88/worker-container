@@ -34,6 +34,15 @@ fi
 echo "Stopping Docker Compose stack..."
 docker compose "${compose_args[@]}" down --rmi all --volumes || true
 
+echo "Stopping any remaining embedding-worker containers..."
+container_ids="$(docker ps -aq --filter "name=embedding-worker"; docker ps -aq --filter "ancestor=embedding-worker:latest" | sort -u)"
+if [[ -n "${container_ids// }" ]]; then
+    docker rm -f $container_ids || true
+    echo "Stopped and removed remaining embedding-worker containers."
+else
+    echo "No remaining embedding-worker containers found."
+fi
+
 echo "Removing image embedding-worker:latest..."
 docker image rm -f embedding-worker:latest || true
 
@@ -53,6 +62,14 @@ if [[ "$remove_cache" =~ ^[Yy]$ ]]; then
     else
         echo "/home/model not found or not accessible from this shell."
     fi
+fi
+
+echo
+read -r -p "Also remove the installation directory at $SCRIPT_DIR? [y/N]: " remove_install_dir
+if [[ "$remove_install_dir" =~ ^[Yy]$ ]]; then
+    cd "$(dirname "$SCRIPT_DIR")"
+    rm -rf "$SCRIPT_DIR"
+    echo "Installation directory removed: $SCRIPT_DIR"
 fi
 
 echo

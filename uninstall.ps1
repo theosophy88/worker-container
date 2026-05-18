@@ -79,6 +79,21 @@ if ($LASTEXITCODE -eq 0) {
     Write-Warn "docker compose down failed or no stack was running."
 }
 
+Write-Info "Stopping any remaining embedding-worker containers..."
+$containerIds = & docker ps -aq --filter "name=embedding-worker" 2>$null
+$containerIds += & docker ps -aq --filter "ancestor=embedding-worker:latest" 2>$null
+$containerIds = $containerIds | Where-Object { $_ -ne "" } | Sort-Object -Unique
+if ($containerIds) {
+    & docker rm -f $containerIds 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Ok "Stopped and removed remaining embedding-worker containers."
+    } else {
+        Write-Warn "Failed to remove some embedding-worker containers."
+    }
+} else {
+    Write-Info "No remaining embedding-worker containers found."
+}
+
 Write-Info "Removing Docker image embedding-worker:latest..."
 & docker image rm -f embedding-worker:latest 2>$null
 if ($LASTEXITCODE -eq 0) {
@@ -104,6 +119,17 @@ if (PromptYN "Also attempt to remove host-mounted model cache at /home/model if 
         }
     } catch {
         Write-Warn "Failed to remove /home/model: $_"
+    }
+}
+
+if (PromptYN "Also remove the installation directory at $ScriptDir?" "n") {
+    try {
+        $parentDir = Split-Path -Parent $ScriptDir
+        Set-Location $parentDir
+        Remove-Item $ScriptDir -Recurse -Force -ErrorAction Stop
+        Write-Ok "Installation directory removed: $ScriptDir"
+    } catch {
+        Write-Warn "Failed to remove installation directory: $_"
     }
 }
 
