@@ -59,6 +59,25 @@ function Prompt-YN($prompt, $default = "y") {
     }
 }
 
+function Get-TotalPhysicalMemoryGB {
+    try {
+        $bytes = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
+        return [math]::Round($bytes / 1GB, 1)
+    } catch {
+        return 0
+    }
+}
+
+function Get-QualifiedGpuAdapters {
+    try {
+        Get-CimInstance Win32_VideoController | Where-Object {
+            $_.AdapterRAM -ge (16 * 1024 * 1024 * 1024)
+        } | Select-Object Name, @{Name='MemoryGB';Expression={[math]::Round($_.AdapterRAM / 1GB, 1)}}
+    } catch {
+        @()
+    }
+}
+
 # ── --Raw: print manual instructions ─────────────────────────────────────────
 if ($Raw) {
     Write-Host @"
@@ -105,7 +124,7 @@ Write-Host ""
 Write-Host "  ╔════════════════════════════════════════════════════════╗" -ForegroundColor Blue
 Write-Host "  ║     EMBEDDING WORKER — Windows Installer               ║" -ForegroundColor Blue
 Write-Host "  ║     HuggingFace · sentence-transformers                ║" -ForegroundColor Blue
-Write-Host "  ║     Qwen/Qwen3-Embedding-8B  |  float16/8bit/4bit      ║" -ForegroundColor Blue
+Write-Host "  ║     Qwen/Qwen3-Embedding-8B  |  float16-only           ║" -ForegroundColor Blue
 Write-Host "  ╚════════════════════════════════════════════════════════╝" -ForegroundColor Blue
 Write-Host ""
 
@@ -329,53 +348,60 @@ if (-not $Reconfigure) {
 # ── Compute mode ──────────────────────────────────────────────────────────────
 Write-Header "Compute Mode — HuggingFace / sentence-transformers"
 Write-Host ""
-Write-Host "  Device auto-detected at runtime (CUDA -> ROCm -> MPS -> CPU)." -ForegroundColor White
-Write-Host "  Choose the precision mode that fits your hardware:" -ForegroundColor White
-Write-Host ""
-Write-Host "    [1]  CPU float32   — pure CPU inference; works everywhere; slowest"
-Write-Host "                         Qwen3-Embedding-8B needs >=32 GB RAM"
-Write-Host "    [2]  GPU float16   — half precision; fastest GPU mode"
-Write-Host "                         Needs >=16 GB VRAM"
-Write-Host "    [3]  GPU 8-bit     — quantised; balanced speed vs. memory"
-Write-Host "                         Needs >=8 GB VRAM; requires bitsandbytes"
-Write-Host "    [4]  GPU 4-bit     — quantised; most memory-efficient"
-Write-Host "                         Needs >=4 GB VRAM; requires bitsandbytes"
+Write-Host "  This installer configures float16 only." -ForegroundColor White
+Write-Host "  Minimum resources for float16: CPU requires >=16 GB RAM, GPU requires >=16 GB VRAM." -ForegroundColor White
 Write-Host ""
 
-$computeChoice = Prompt-Input "Compute mode" "1"
-$COMPUTE_MODE  = "cpu"
+$ramGB = Get-TotalPhysicalMemoryGB
+$qualifiedGpus = Get-QualifiedGpuAdapters
+$hasCpu = $ramGB -ge 16
+$hasGpu = $qualifiedGpus.Count -gt 0
+
+Write-Host "  System RAM detected: ${ramGB} GB" -ForegroundColor White
+if ($hasGpu) {
+    Write-Host "  GPU(s) with >=16 GB VRAM detected:" -ForegroundColor White
+    foreach ($gpu in $qualifiedGpus) {
+        Write-Host "    - $($gpu.Name) ($($gpu.MemoryGB) GB)" -ForegroundColor White
+    }
+} else {
+    Write-Host "  No GPU with >=16 GB VRAM detected." -ForegroundColor Yellow
+}
+Write-Host ""
+
+if (-not $hasCpu -and -not $hasGpu) {
+    Write-Err "This machine does not meet minimum float16 requirements."
+    Write-Err "Minimum requirements: CPU >=16 GB RAM, or GPU >=16 GB VRAM."
+    Write-Err "Use a machine with enough resources or install on a different host."
+    exit 1
+}
+
+if ($hasCpu -and $hasGpu) {
+    Write-Host "  Both CPU and GPU meet float16 minimums." -ForegroundColor White
+    Write-Host "    [1]  CPU float16   — requires >=16 GB RAM" -ForegroundColor White
+    Write-Host "    [2]  GPU float16   — requires >=16 GB VRAM" -ForegroundColor White
+    Write-Host ""
+    $computeChoice = Prompt-Input "Target device" "2"
+} elseif ($hasGpu) {
+    Write-Host "  Only GPU float16 is available on this host." -ForegroundColor White
+    $computeChoice = "2"
+} else {
+    Write-Host "  Only CPU float16 is available on this host." -ForegroundColor White
+    $computeChoice = "1"
+}
+
+$COMPUTE_MODE  = "gpu"
 $GPU_TYPE      = ""
-$PRECISION     = "float32"
+$PRECISION     = "float16"
 $HSA_OVERRIDE  = ""
 
 switch ($computeChoice) {
     "1" {
         $COMPUTE_MODE = "cpu"
-        $PRECISION    = "float32"
+        $PRECISION    = "float16"
     }
     "2" {
         $COMPUTE_MODE = "gpu"
         $PRECISION    = "float16"
-        Write-Host "    [1] NVIDIA (CUDA)   [2] AMD (ROCm)" -ForegroundColor Gray
-        $gt = Prompt-Input "GPU type" "1"
-        $GPU_TYPE = if ($gt -eq "2") { "amd" } else { "nvidia" }
-        if ($GPU_TYPE -eq "amd") {
-            $HSA_OVERRIDE = Prompt-Input "HSA_OVERRIDE_GFX_VERSION (e.g. 11.0.0, blank to skip)" ""
-        }
-    }
-    "3" {
-        $COMPUTE_MODE = "gpu"
-        $PRECISION    = "8bit"
-        Write-Host "    [1] NVIDIA (CUDA)   [2] AMD (ROCm)" -ForegroundColor Gray
-        $gt = Prompt-Input "GPU type" "1"
-        $GPU_TYPE = if ($gt -eq "2") { "amd" } else { "nvidia" }
-        if ($GPU_TYPE -eq "amd") {
-            $HSA_OVERRIDE = Prompt-Input "HSA_OVERRIDE_GFX_VERSION (e.g. 11.0.0, blank to skip)" ""
-        }
-    }
-    "4" {
-        $COMPUTE_MODE = "gpu"
-        $PRECISION    = "4bit"
         Write-Host "    [1] NVIDIA (CUDA)   [2] AMD (ROCm)" -ForegroundColor Gray
         $gt = Prompt-Input "GPU type" "1"
         $GPU_TYPE = if ($gt -eq "2") { "amd" } else { "nvidia" }
