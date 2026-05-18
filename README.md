@@ -133,6 +133,25 @@ psql -U myuser -d mydb -c "
 "
 ```
 
+## Uninstall
+
+**Windows:**
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\uninstall.ps1
+```
+
+**Linux:**
+```bash
+bash uninstall.sh
+```
+
+Running either script will:
+- stop and remove the Docker Compose stack
+- remove the `embedding-worker:latest` image
+- delete generated `.env`
+- optionally remove the host model cache at `/home/model`
+
 ## Admin Control — `admin.sh`
 
 Unified script for all worker management. Use **interactively** or with **command-line arguments**.
