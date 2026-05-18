@@ -1,0 +1,15 @@
+.git
+.gitignore
+*.zip
+*.md
+*.pdf
+*.tgz
+*.tar.gz
+*.log
+.env
+.env.*
+*.swp
+*.tmp
+__pycache__/
+*.py[cod]
+.DS_Store

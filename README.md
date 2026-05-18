@@ -16,6 +16,28 @@ git clone <your-repo-url>
 cd embedding-worker
 ```
 
+## Bootstrap install from GitHub
+
+Run a single bootstrap script from GitHub to clone, install, and configure the worker:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/theosophy88/worker-container/main/setup.sh)"
+```
+
+Or if you already have the repo locally:
+
+```bash
+./setup.sh install
+./setup.sh update
+./setup.sh remove
+```
+
+You can also override the install path:
+
+```bash
+WORKER_DIR=/opt/embedding-worker bash setup.sh install
+```
+
 ## Architecture
 
 ```
