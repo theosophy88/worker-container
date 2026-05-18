@@ -19,7 +19,15 @@
 
 # ── Source all lib modules ────────────────────────────────────────────────────
 
-_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_SCRIPT_PATH="${BASH_SOURCE[0]}"
+if [[ -L "${_SCRIPT_PATH}" ]]; then
+    if command -v readlink &>/dev/null; then
+        _SCRIPT_PATH="$(readlink -f "${_SCRIPT_PATH}" 2>/dev/null || echo "${_SCRIPT_PATH}")"
+    elif command -v realpath &>/dev/null; then
+        _SCRIPT_PATH="$(realpath "${_SCRIPT_PATH}" 2>/dev/null || echo "${_SCRIPT_PATH}")"
+    fi
+fi
+_SCRIPT_DIR="$(cd "$(dirname "${_SCRIPT_PATH}")" && pwd)"
 LIB_DIR="${_SCRIPT_DIR}/lib"
 
 for lib_file in "$LIB_DIR"/{colors,docker,env,state,cpu,stats,ui}.sh; do
