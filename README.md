@@ -27,7 +27,8 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/theosophy88/worker-conta
 Or if you already have the repo locally:
 
 ```bash
-./setup.sh install
+./setup.sh          # clone/update repo and run install
+./setup.sh install  # same as above
 ./setup.sh update
 ./setup.sh remove
 ```
