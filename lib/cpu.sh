@@ -134,12 +134,14 @@ apply_cpu_limit() {
     local cid; cid=$(get_container_id)
     [[ -z "$cid" ]] && { err "No running container"; return 1; }
 
-    # Apply using cpuset (core pinning)
+    # Apply using cpuset (core pinning).
+    # Use an explicit full-core range for max cores instead of an empty cpuset,
+    # because some Docker versions do not remove pinning cleanly with "".
     if [[ "$new_cores" -ge "$total" ]]; then
-        # Remove pinning — allow all cores
-        local cmd="$DOCKER update --cpuset-cpus=\"\" \"$cid\""
+        local cpuset="0-$(( total - 1 ))"
+        local cmd="$DOCKER update --cpuset-cpus=\"${cpuset}\" \"$cid\""
         if retry_docker_update "$cmd"; then
-            ok "CPU limit removed — using all ${total} cores (unlimited)"
+            ok "CPU pinned to all ${total} cores (cores ${cpuset})"
         else
             return 1
         fi
@@ -179,7 +181,8 @@ EOF
             sleep "$secs"
             local rcid; rcid=$($DOCKER ps --quiet --filter "name=^${CONTAINER_NAME}$" | head -1 || $DOCKER ps --quiet | head -1)
             [[ -n "$rcid" ]] && {
-                local revert_cmd="$DOCKER update --cpuset-cpus=\"\" \"$rcid\""
+                local full_cpuset="0-$(( total - 1 ))"
+                local revert_cmd="$DOCKER update --cpuset-cpus=\"${full_cpuset}\" \"$rcid\""
                 if retry_docker_update "$revert_cmd"; then
                     printf "[%s] CPU auto-reverted to %s cores after %s\n" \
                         "$(date '+%Y-%m-%d %H:%M:%S')" "$total" "$duration" >> "$CPU_LOG_FILE"
@@ -225,7 +228,8 @@ quick_cpu_adjust() {
     [[ -z "$cid" ]] && { err "No running container"; return 1; }
 
     if [[ "$new" -ge "$total" ]]; then
-        $DOCKER update --cpuset-cpus="" "$cid" &>/dev/null || true
+        local full_cpuset="0-$(( total - 1 ))"
+        $DOCKER update --cpuset-cpus="${full_cpuset}" "$cid" &>/dev/null || true
     else
         local last_core=$(( new - 1 ))
         $DOCKER update --cpuset-cpus="0-${last_core}" "$cid" &>/dev/null || true
