@@ -862,49 +862,30 @@ DCAMD
 # ── Compute/precision configuration ───────────────────────────────────────────
 # HuggingFace sentence-transformers loads the full model in-process.
 # Device is auto-detected at runtime: CUDA → ROCm → MPS → CPU.
-# PRECISION controls memory vs. speed tradeoff for the 8B model:
-#   float16 — half precision  (≥16 GB VRAM)
-#   float32 — full precision  (CPU default; also works on GPU)
-#   8bit    — quantised GPU   (≥8 GB VRAM; requires bitsandbytes)
-#   4bit    — quantised GPU   (≥4 GB VRAM; requires bitsandbytes)
+# This installer uses float16 only:
+#   float16 — half precision (CPU requires >=16 GB RAM, GPU requires >=16 GB VRAM)
 # ──────────────────────────────────────────────────────────────────────────────
-COMPUTE_MODE="" GPU_TYPE="" PRECISION="float32" HSA_OVERRIDE=""
+COMPUTE_MODE="" GPU_TYPE="" PRECISION="float16" HSA_OVERRIDE=""
 
 configure_compute() {
     hdr "Compute Mode — HuggingFace / sentence-transformers"
     echo ""
     echo -e "  ${BOLD}Device auto-detected at runtime (CUDA → ROCm → MPS → CPU).${NC}"
-    echo -e "  ${BOLD}Choose the precision mode that fits your hardware:${NC}"
+    echo -e "  ${BOLD}This installer configures float16 only.${NC}"
     echo ""
-    echo "    [1]  CPU float32   — pure CPU inference; works everywhere; slowest"
-    echo "                         Qwen3-Embedding-8B needs ≥32 GB RAM"
-    echo "    [2]  GPU float16   — half precision; fastest GPU mode"
-    echo "                         Needs ≥16 GB VRAM"
-    echo "    [3]  GPU 8-bit     — quantised; balanced speed vs. memory"
-    echo "                         Needs ≥8 GB VRAM; requires bitsandbytes"
-    echo "    [4]  GPU 4-bit     — quantised; most memory-efficient"
-    echo "                         Needs ≥4 GB VRAM; requires bitsandbytes"
+    echo "    [1]  CPU float16   — requires >=16 GB RAM"
+    echo "    [2]  GPU float16   — requires >=16 GB VRAM"
     echo ""
-    ask "Compute mode" "1"
+    ask "Target device" "2"
 
     case "$REPLY" in
         1)
             COMPUTE_MODE="cpu"
-            PRECISION="float32"
+            PRECISION="float16"
             ;;
         2)
             COMPUTE_MODE="gpu"
             PRECISION="float16"
-            _ask_gpu_type
-            ;;
-        3)
-            COMPUTE_MODE="gpu"
-            PRECISION="8bit"
-            _ask_gpu_type
-            ;;
-        4)
-            COMPUTE_MODE="gpu"
-            PRECISION="4bit"
             _ask_gpu_type
             ;;
         *)
@@ -1244,7 +1225,7 @@ print_banner() {
   ╔═══════════════════════════════════════════════════════════╗
   ║       EMBEDDING WORKER — Universal Linux Installer        ║
   ║       HuggingFace · sentence-transformers                 ║
-  ║       Qwen/Qwen3-Embedding-8B  |  float16/8bit/4bit       ║
+  ║       Qwen/Qwen3-Embedding-8B  |  float16-only           ║
   ║                                                           ║
   ║  Supported: Ubuntu · Debian · CentOS · RHEL · Fedora      ║
   ║             Rocky · Alma · Arch · openSUSE · Alpine        ║
