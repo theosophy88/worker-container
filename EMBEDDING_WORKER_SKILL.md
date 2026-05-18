@@ -265,7 +265,6 @@ workers process the same record simultaneously.
 - Final `"status": "stopped"` POST on clean exit
 - Dockerfile base changed to `python:3.11-slim`
 
-### v1 — Ollama edition
-- Ollama + llama.cpp backend
-- CPU / GPU / Mixed layer-split modes
-- `OLLAMA_NUM_GPU` / `OLLAMA_NUM_THREAD` controls
+### v1 — Ollama edition (removed)
+- Legacy: Ollama + llama.cpp backend. This project no longer ships or
+  configures Ollama; the current codebase uses HuggingFace `sentence-transformers`.

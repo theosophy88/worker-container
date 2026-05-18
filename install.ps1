@@ -410,6 +410,27 @@ if ($N8N_STATUS_URL -ne "") {
 }
 Write-Host ""
 $HF_MODEL_NAME = Prompt-Input "HuggingFace model name" "Qwen/Qwen3-Embedding-8B"
+Write-Host ""
+Write-Host "  Model source options:" -ForegroundColor White
+Write-Host "    [hf]    — download from HuggingFace Hub (may require API token)" -ForegroundColor White
+Write-Host "    [url]   — direct HTTP URL to a model archive (zip/tar.gz)" -ForegroundColor White
+Write-Host "    [local] — local path on the host (must be mounted into the container)" -ForegroundColor White
+
+$modelSource = Prompt-Input "Model source (hf/url/local)" "hf"
+$HF_AUTH_TOKEN = ""
+$HF_MODEL_URL = ""
+$HF_MODEL_LOCAL_PATH = ""
+if ($modelSource -eq "hf") {
+    $HF_AUTH_TOKEN = Prompt-Input "HuggingFace API token (leave blank to use public or existing creds)" ""
+} elseif ($modelSource -eq "url") {
+    $HF_MODEL_URL = Prompt-Input "Direct model URL (zip or tar.gz)" ""
+} elseif ($modelSource -eq "local") {
+    $HF_MODEL_LOCAL_PATH = Prompt-Input "Local model path (host path, mapped to container)" ""
+} else {
+    Write-Warn "Unknown source type — defaulting to HuggingFace Hub"
+    $modelSource = "hf"
+    $HF_AUTH_TOKEN = Prompt-Input "HuggingFace API token (leave blank to use public or existing creds)" ""
+}
 
 $defaultBatch  = if ($COMPUTE_MODE -eq "cpu") { "2" } else { "10" }
 Write-Host "  Recommended: CPU=2-5  GPU=10-50" -ForegroundColor DarkGray
@@ -438,6 +459,13 @@ STATUS_INTERVAL=$STATUS_INTERVAL
 # -- Model (HuggingFace) ------------------------------------------------------
 HF_MODEL_NAME=$HF_MODEL_NAME
 HF_HOME=/root/.cache/huggingface
+# Optional model source settings:
+# HF_AUTH_TOKEN — API token for HuggingFace Hub (written to container env)
+# HF_MODEL_URL  — direct HTTP URL to a model archive (zip/tar.gz)
+# HF_MODEL_LOCAL_PATH — path on host mounted into container for local models
+HF_AUTH_TOKEN=$HF_AUTH_TOKEN
+HF_MODEL_URL=$HF_MODEL_URL
+HF_MODEL_LOCAL_PATH=$HF_MODEL_LOCAL_PATH
 
 # -- Precision / compute ------------------------------------------------------
 # PRECISION: float16 | float32 | 8bit | 4bit

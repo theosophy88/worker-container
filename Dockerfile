@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir \
     accelerate \
     bitsandbytes \
     requests
+    psutil
 
 ENV HF_HOME=/root/.cache/huggingface
 

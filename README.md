@@ -21,7 +21,7 @@ cd embedding-worker
 ```
 [Server 1]              [Your server]           [PostgreSQL]
 Docker container   →    n8n GET webhook   →    Claim batch (status = node_name)
-  Ollama (model)        n8n SAVE webhook  →    Save vector + status = 'done'
+  HuggingFace (model)   n8n SAVE webhook  →    Save vector + status = 'done'
   worker.py loop   ←────────────────────────── Return {id, description}
 ```
 

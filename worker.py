@@ -59,6 +59,9 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 
 N8N_STATUS_URL  = os.getenv("N8N_STATUS_URL",  "").strip()
 STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", "10"))
+HF_AUTH_TOKEN   = os.getenv("HF_AUTH_TOKEN", "").strip()
+HF_MODEL_URL    = os.getenv("HF_MODEL_URL", "").strip()
+HF_MODEL_LOCAL_PATH = os.getenv("HF_MODEL_LOCAL_PATH", "").strip()
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -182,6 +185,43 @@ def detect_device() -> str:
     log.info("No GPU detected — using CPU")
     return "cpu"
 
+
+def check_memory_requirements(device: str) -> None:
+    """Ensure minimum memory for float16 mode (16 GB RAM/VRAM).
+
+    Exits the process with an error if the requirement is not met when
+    `PRECISION` is `float16`. For GPUs we inspect CUDA properties; for CPU
+    we use `psutil` when available.
+    """
+    if PRECISION != "float16":
+        return
+
+    min_bytes = 16 * 1024 ** 3
+
+    import torch
+
+    if device == "cuda":
+        try:
+            props = torch.cuda.get_device_properties(0)
+            total = getattr(props, 'total_memory', None)
+            if total is not None and total < min_bytes:
+                log.error(f"GPU memory {total // (1024**3)}GB < required 16GB for float16")
+                sys.exit(1)
+        except Exception as e:
+            log.warning(f"Could not detect CUDA memory: {e} — ensure >=16GB VRAM for float16")
+    elif device == "mps":
+        log.warning("Unable to programmatically detect MPS device memory — ensure >=16GB for float16")
+    else:  # cpu
+        try:
+            import psutil
+            total = psutil.virtual_memory().total
+            if total < min_bytes:
+                log.error(f"System RAM {total // (1024**3)}GB < required 16GB for float16 on CPU")
+                sys.exit(1)
+        except Exception:
+            log.error("psutil not installed; cannot verify system RAM. Install psutil or set PRECISION=float32")
+            sys.exit(1)
+
 # ── Model loading ─────────────────────────────────────────────────────────────
 
 def load_model(device: str):
@@ -215,6 +255,59 @@ def load_model(device: str):
     )
     log.info("Model loaded.")
     return model
+
+
+def download_and_prepare_remote_model(hf_home: str) -> str | None:
+    """Download a model archive from `HF_MODEL_URL` and extract it under HF_HOME.
+
+    Returns the local path to the extracted model directory, or None on failure.
+    Supports .zip and .tar.gz archives.
+    """
+    if not HF_MODEL_URL:
+        return None
+
+    import os
+    import requests
+    import shutil
+    import tempfile
+    import tarfile
+    import zipfile
+
+    try:
+        os.makedirs(hf_home, exist_ok=True)
+        base = os.path.basename(HF_MODEL_URL).split('?')[0]
+        name = os.path.splitext(base)[0]
+        dest_dir = os.path.join(hf_home, 'custom_models', name)
+        if os.path.isdir(dest_dir):
+            log.info(f"Remote model already present at {dest_dir}")
+            return dest_dir
+
+        log.info(f"Downloading remote model from {HF_MODEL_URL}...")
+        resp = requests.get(HF_MODEL_URL, stream=True, timeout=60)
+        resp.raise_for_status()
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = os.path.join(td, base)
+            with open(tmp_path, 'wb') as f:
+                shutil.copyfileobj(resp.raw, f)
+
+            # Extract
+            if base.endswith('.zip'):
+                with zipfile.ZipFile(tmp_path, 'r') as z:
+                    z.extractall(dest_dir)
+            elif base.endswith('.tar.gz') or base.endswith('.tgz'):
+                with tarfile.open(tmp_path, 'r:gz') as t:
+                    t.extractall(dest_dir)
+            else:
+                # not an archive — save as-is
+                os.makedirs(dest_dir, exist_ok=True)
+                shutil.move(tmp_path, os.path.join(dest_dir, base))
+
+        log.info(f"Remote model prepared at {dest_dir}")
+        return dest_dir
+    except Exception as e:
+        log.error(f"Failed to download/prepare remote model: {e}")
+        return None
 
 # ── Embedding ─────────────────────────────────────────────────────────────────
 
@@ -361,6 +454,34 @@ def post_status(status: str, cycle: int, device: str) -> None:
 
 def main():
     device = detect_device()
+    check_memory_requirements(device)
+
+    # If HF auth token provided in env, export it for huggingface_hub
+    if HF_AUTH_TOKEN:
+        os.environ["HUGGINGFACE_HUB_TOKEN"] = HF_AUTH_TOKEN
+
+    # If user provided a local path, prefer that
+    if HF_MODEL_LOCAL_PATH:
+        if os.path.isdir(HF_MODEL_LOCAL_PATH):
+            log.info(f"Using local model path: {HF_MODEL_LOCAL_PATH}")
+            HF_MODEL_NAME_LOCAL = HF_MODEL_LOCAL_PATH
+        else:
+            log.error(f"Local model path not found: {HF_MODEL_LOCAL_PATH}")
+            sys.exit(1)
+    else:
+        HF_MODEL_NAME_LOCAL = None
+
+    # If a remote URL is provided, download & extract into HF_HOME
+    hf_home = os.getenv("HF_HOME", "/root/.cache/huggingface")
+    if HF_MODEL_URL and not HF_MODEL_NAME_LOCAL:
+        downloaded = download_and_prepare_remote_model(hf_home)
+        if downloaded:
+            HF_MODEL_NAME_LOCAL = downloaded
+
+    # If we have a local model directory, set HF_MODEL_NAME to that path
+    if HF_MODEL_NAME_LOCAL:
+        HF_MODEL_NAME = HF_MODEL_NAME_LOCAL
+
     model  = load_model(device)
 
     log.info("Running test embedding...")
