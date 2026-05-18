@@ -152,6 +152,28 @@ Running either script will:
 - delete generated `.env`
 - optionally remove the host model cache at `/home/model`
 
+Manual removal steps (if you do not use the uninstall script):
+
+**Windows:**
+```powershell
+cd C:\path\to\Worker
+docker compose down --rmi all --volumes
+docker image rm -f embedding-worker:latest
+Remove-Item .env -Force
+# optionally remove model cache if mounted on host
+Remove-Item -Recurse -Force C:\path\to\host\model\cache
+```
+
+**Linux:**
+```bash
+cd /path/to/Worker
+docker compose down --rmi all --volumes
+docker image rm -f embedding-worker:latest
+rm -f .env
+# optionally remove model cache if mounted on host
+rm -rf /home/model
+```
+
 ## Admin Control — `admin.sh`
 
 Unified script for all worker management. Use **interactively** or with **command-line arguments**.
