@@ -73,7 +73,10 @@ run_uninstall() {
   bash uninstall.sh
 }
 
-command="${1:-install}"
+if [[ $# -eq 0 ]]; then
+  set -- install
+fi
+command="$1"
 case "$command" in
   install)
     require_command git
