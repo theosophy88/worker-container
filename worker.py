@@ -27,6 +27,7 @@ import json
 import logging
 import signal
 from datetime import datetime, timedelta, timezone
+from collections import deque
 
 import requests
 
@@ -35,6 +36,9 @@ total_embedded = 0
 total_errors   = 0
 total_fetched  = 0
 _start_time    = time.time()
+embed_history  = deque()
+_shutdown      = False
+_stopping_status_sent = False
 
 # ── Config from environment ───────────────────────────────────────────────────
 
@@ -184,6 +188,32 @@ def detect_device() -> str:
         pass
     log.info("No GPU detected — using CPU")
     return "cpu"
+
+
+def get_cpu_info() -> dict:
+    """Return the number of total and active cores for this process."""
+    total = os.cpu_count() or 1
+    active = total
+    try:
+        import psutil
+        total = psutil.cpu_count(logical=True) or total
+        process = psutil.Process(os.getpid())
+        active = len(process.cpu_affinity())
+    except Exception:
+        pass
+    return {
+        "cores_total": total,
+        "cores_active": active,
+    }
+
+
+def prune_embed_history(window: timedelta) -> int:
+    """Keep only embedding events within `window` and return the count."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - window
+    while embed_history and embed_history[0][0] < cutoff:
+        embed_history.popleft()
+    return sum(count for _, count in embed_history)
 
 
 def check_memory_requirements(device: str) -> None:
@@ -345,6 +375,7 @@ def embed_batch(model, records: list[dict]) -> list[dict]:
             continue
 
         total_embedded += 1
+        embed_history.append((datetime.now(timezone.utc), 1))
         results.append({
             "id":        news_id,
             "vector":    vector,
@@ -427,18 +458,46 @@ def save_vectors(vectors: list[dict]) -> bool:
     log.error("Failed to save vectors after 3 attempts")
     return False
 
-def post_status(status: str, cycle: int, device: str) -> None:
+def post_status(status: str, cycle: int, device: str, stop_at: datetime | None = None) -> None:
     """POST worker heartbeat/status to n8n. Non-fatal if it fails."""
     if not N8N_STATUS_URL:
         return
+
+    uptime_seconds = int(time.time() - _start_time)
+    since_start_hours = max(uptime_seconds / 3600, 1 / 3600)
+    avg_hour = total_embedded / since_start_hours
+    avg_min = avg_hour / 60
+    recent_hour = prune_embed_history(timedelta(hours=1))
+    next_status_in_seconds = None
+    next_status_at = None
+    if STATUS_INTERVAL > 0:
+        remaining_cycles = STATUS_INTERVAL - (cycle % STATUS_INTERVAL)
+        if remaining_cycles == STATUS_INTERVAL:
+            remaining_cycles = STATUS_INTERVAL
+        next_status_in_seconds = int(remaining_cycles * DELAY_SECONDS)
+        next_status_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=next_status_in_seconds)
+        ).isoformat()
+
+    cpu_info = get_cpu_info()
     payload = {
-        "node_name":         NODE_NAME,
-        "status":            status,
-        "cycles":            cycle,
-        "articles_embedded": total_embedded,
-        "device":            device,
-        "uptime_seconds":    int(time.time() - _start_time),
-        "model_name":        HF_MODEL_NAME,
+        "node_name":                         NODE_NAME,
+        "status":                            status,
+        "cycles":                            cycle,
+        "articles_embedded":                 total_embedded,
+        "device":                            device,
+        "uptime_seconds":                    uptime_seconds,
+        "model_name":                        HF_MODEL_NAME,
+        "server_started_at":                 datetime.fromtimestamp(_start_time, timezone.utc).isoformat(),
+        "stop_time":                         stop_at.isoformat() if stop_at else None,
+        "avg_embeddings_per_hour":           round(avg_hour, 2),
+        "avg_embeddings_per_minute":         round(avg_min, 2),
+        "avg_embeddings_last_hour":          recent_hour,
+        "avg_embeddings_last_hour_per_minute": round(recent_hour / 60, 2),
+        "cores_total":                       cpu_info["cores_total"],
+        "cores_active":                      cpu_info["cores_active"],
+        "next_status_in_seconds":            next_status_in_seconds,
+        "next_status_at":                    next_status_at,
     }
     try:
         resp = requests.post(
@@ -453,6 +512,8 @@ def post_status(status: str, cycle: int, device: str) -> None:
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
+    global _stopping_status_sent
+
     device = detect_device()
     check_memory_requirements(device)
 
@@ -545,15 +606,22 @@ def main():
 
             save_vectors(vectors)
 
+            if _shutdown and not _stopping_status_sent:
+                post_status("stopping", cycle, device, stop_at)
+                _stopping_status_sent = True
+
             if N8N_STATUS_URL and STATUS_INTERVAL > 0 and cycle % STATUS_INTERVAL == 0:
-                post_status("running", cycle, device)
+                post_status("running", cycle, device, stop_at)
 
             if not should_stop(stop_at):
                 log.info(f"Waiting {DELAY_SECONDS}s before next cycle...")
                 time.sleep(DELAY_SECONDS)
 
+        if _shutdown and not _stopping_status_sent:
+            post_status("stopping", cycle, device, stop_at)
+
     finally:
-        post_status("stopped", cycle, device)
+        post_status("stopped", cycle, device, stop_at)
         log.info(f"Worker stopped. Session total: {total_embedded} embedded, {total_errors} errors.")
 
 if __name__ == "__main__":
