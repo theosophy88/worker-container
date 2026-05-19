@@ -12,4 +12,10 @@ echo "  Precision: $PRECISION"
 echo "========================================"
 
 echo "[startup] Starting embedding worker..."
-exec python3 /app/worker.py
+
+# Use modularized version if available, otherwise fall back to legacy worker.py
+if [[ -f "/app/run_worker.py" ]]; then
+    exec python3 /app/run_worker.py
+else
+    exec python3 /app/worker.py
+fi

@@ -1,22 +1,28 @@
 """
-Embedding Worker
-================
-Loops forever (or until stop duration):
-  1. Calls n8n GET webhook  → receives batch of {id, description}
-  2. Embeds each description via local HuggingFace sentence-transformers model
-  3. Calls n8n POST webhook → saves vectors back to DB
-  4. Sleeps for DELAY_SECONDS
-  5. Repeat
+Embedding Worker — LEGACY/DEPRECATED
+=====================================
 
-STOP_AT format examples:
-  30m          → stop after 30 minutes
-  5h           → stop after 5 hours
-  1d           → stop after 1 day (24 hours)
-  1d-5h        → stop after 29 hours
-  1d-5h-30m    → stop after 29 hours 30 minutes
-  (empty)      → run forever until manually stopped
+⚠️  This file is deprecated. The codebase has been refactored into modular components.
 
-All config via environment variables (see .env.example).
+NEW STRUCTURE:
+- Primary entry point: run_worker.py (uses src/worker/ modules)
+- Modular architecture: see src/ARCHITECTURE.md
+- This file is kept for backwards compatibility only
+
+This monolithic version is maintained only for fallback purposes.
+For new deployments or modifications, use the modular structure in src/worker/
+
+The main changes include:
+- Modular package organization (config, embedding, model, n8n_api, etc.)
+- Improved testability and maintainability
+- Cleaner separation of concerns
+- See src/ARCHITECTURE.md for the new structure
+
+To use the new structure, run:
+  python3 run_worker.py
+
+The Docker entrypoint automatically prefers run_worker.py over this file.
+=====================================
 """
 
 import os

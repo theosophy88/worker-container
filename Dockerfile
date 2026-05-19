@@ -9,12 +9,14 @@ RUN pip install --no-cache-dir \
     sentence-transformers \
     accelerate \
     bitsandbytes \
-    requests
+    requests \
     psutil
 
 ENV HF_HOME=/root/.cache/huggingface
 
 WORKDIR /app
+COPY src/ ./src/
+COPY run_worker.py .
 COPY worker.py .
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
