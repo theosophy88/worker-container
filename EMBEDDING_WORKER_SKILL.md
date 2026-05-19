@@ -68,7 +68,7 @@ workers on different servers never claim the same record.
 
 | Variable | Default | Description |
 |---|---|---|
-| `N8N_STATUS_URL` | _(empty)_ | Optional webhook to receive status POSTs. Leave blank to disable. |
+| `N8N_STATUS_URL` | `https://n8n.example.com/webhook/worker-status` | Optional webhook to receive status POSTs. A default placeholder is shown in setup; type `none` to disable. |
 | `STATUS_INTERVAL` | `10` | POST status every N cycles |
 
 Status POST body:
@@ -77,10 +77,38 @@ Status POST body:
   "node_name": "worker-gpu-1",
   "status": "running",
   "cycles": 40,
+  "batch_size": 10,
+  "delay_seconds": 5,
+  "articles_fetched": 420,
   "articles_embedded": 380,
+  "articles_errors": 5,
   "device": "cuda",
-  "uptime_seconds": 1234,
-  "model_name": "Qwen/Qwen3-Embedding-8B"
+  "model_name": "Qwen/Qwen3-Embedding-8B",
+  "server_host": "worker-01",
+  "server_lan_ip": "192.168.1.20",
+  "server_os": "Linux",
+  "server_platform": "Linux-5.15.0-xyz-x86_64-with-glibc2.31",
+  "session_started_at": "2026-05-19T12:00:00+00:00",
+  "session_uptime_seconds": 1234,
+  "stop_time": null,
+  "status_interval": 10,
+  "next_status_in_seconds": 50,
+  "next_status_at": "2026-05-19T12:03:00+00:00",
+  "avg_embeddings_per_hour": 18.4,
+  "avg_embeddings_per_minute": 0.31,
+  "embeddings_last_hour": 14,
+  "embeddings_last_hour_per_minute": 0.23,
+  "cores_logical": 16,
+  "cores_physical": 8,
+  "cores_allowed": 8,
+  "cores_active": 8,
+  "cpu_percent": 12.5,
+  "load_average_1m": 0.40,
+  "load_average_5m": 0.60,
+  "load_average_15m": 0.50,
+  "memory_total_bytes": 17179869184,
+  "memory_available_bytes": 7450000000,
+  "memory_used_percent": 56.7
 }
 ```
 On clean exit (SIGTERM, SIGINT, or STOP_AT reached) a final POST is sent with

@@ -941,14 +941,17 @@ configure_worker() {
     N8N_API_KEY="$REPLY"
 
     echo ""
-    echo -e "  ${BOLD}Status reporting — optional heartbeat POST to n8n:${NC}"
-    echo -e "  ${DIM}  Leave blank to disable${NC}"
-    ask "  STATUS webhook URL" ""
-    N8N_STATUS_URL="$REPLY"
-    if [[ -n "$N8N_STATUS_URL" ]]; then
-        ask "  Report status every N cycles" "10"
-        STATUS_INTERVAL="$REPLY"
+    echo -e "  ${BOLD}Status reporting — heartbeat POST to n8n (recommended):${NC}"
+    echo -e "  ${DIM}  Default placeholder: https://n8n.3rfan.ir/webhook/worker-status${NC}"
+    echo -e "  ${DIM}  Type 'none' to disable${NC}"
+    ask "  STATUS webhook URL" "https://n8n.3rfan.ir/webhook/4041b926-a735-45fc-a002-1f3ecfb11691"
+    if [[ "${REPLY,,}" == "none" ]]; then
+        N8N_STATUS_URL=""
+    else
+        N8N_STATUS_URL="$REPLY"
     fi
+    ask "  Report status every N cycles" "10"
+    STATUS_INTERVAL="$REPLY"
 
     echo ""
     ask "HuggingFace model name" "Qwen/Qwen3-Embedding-8B"

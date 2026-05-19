@@ -24,6 +24,8 @@ import sys
 import re
 import time
 import json
+import socket
+import platform
 import logging
 import signal
 from datetime import datetime, timedelta, timezone
@@ -191,19 +193,93 @@ def detect_device() -> str:
 
 
 def get_cpu_info() -> dict:
-    """Return the number of total and active cores for this process."""
-    total = os.cpu_count() or 1
-    active = total
+    """Return CPU and load statistics for the host and current process."""
+    total_logical = os.cpu_count() or 1
+    total_physical = None
+    active = total_logical
+    cpu_percent = None
+    load_average = {"1m": None, "5m": None, "15m": None}
+
     try:
         import psutil
-        total = psutil.cpu_count(logical=True) or total
+        total_logical = psutil.cpu_count(logical=True) or total_logical
+        total_physical = psutil.cpu_count(logical=False) or total_logical
         process = psutil.Process(os.getpid())
-        active = len(process.cpu_affinity())
+        try:
+            affinity = process.cpu_affinity()
+            active = len(affinity)
+        except Exception:
+            active = total_logical
+        cpu_percent = psutil.cpu_percent(interval=None)
+    except Exception:
+        total_physical = total_logical
+
+    try:
+        if hasattr(os, "getloadavg"):
+            one, five, fifteen = os.getloadavg()
+            load_average = {
+                "1m": round(one, 2),
+                "5m": round(five, 2),
+                "15m": round(fifteen, 2),
+            }
     except Exception:
         pass
+
     return {
-        "cores_total": total,
+        "cores_logical": total_logical,
+        "cores_physical": total_physical,
+        "cores_allowed": active,
         "cores_active": active,
+        "cpu_percent": cpu_percent,
+        "load_average_1m": load_average["1m"],
+        "load_average_5m": load_average["5m"],
+        "load_average_15m": load_average["15m"],
+    }
+
+
+def get_memory_info() -> dict:
+    """Return system memory statistics if available."""
+    memory = {
+        "total_bytes": None,
+        "available_bytes": None,
+        "used_percent": None,
+    }
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        memory = {
+            "total_bytes": vm.total,
+            "available_bytes": vm.available,
+            "used_percent": round(vm.percent, 2),
+        }
+    except Exception:
+        pass
+    return memory
+
+
+def get_server_info() -> dict:
+    """Return host name, LAN IP, and operating system information."""
+    hostname = socket.gethostname()
+    lan_ip = None
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            lan_ip = s.getsockname()[0]
+    except Exception:
+        pass
+
+    if not lan_ip or lan_ip.startswith("127."):
+        try:
+            lan_ip = socket.gethostbyname(hostname)
+        except Exception:
+            pass
+
+    return {
+        "hostname": hostname,
+        "lan_ip": lan_ip,
+        "os": platform.system(),
+        "platform": platform.platform(),
     }
 
 
@@ -480,24 +556,44 @@ def post_status(status: str, cycle: int, device: str, stop_at: datetime | None =
         ).isoformat()
 
     cpu_info = get_cpu_info()
+    memory_info = get_memory_info()
+    server_info = get_server_info()
     payload = {
         "node_name":                         NODE_NAME,
         "status":                            status,
         "cycles":                            cycle,
+        "batch_size":                        BATCH_SIZE,
+        "delay_seconds":                     DELAY_SECONDS,
+        "articles_fetched":                  total_fetched,
         "articles_embedded":                 total_embedded,
+        "articles_errors":                   total_errors,
         "device":                            device,
-        "uptime_seconds":                    uptime_seconds,
         "model_name":                        HF_MODEL_NAME,
-        "server_started_at":                 datetime.fromtimestamp(_start_time, timezone.utc).isoformat(),
+        "server_host":                      server_info["hostname"],
+        "server_lan_ip":                    server_info["lan_ip"],
+        "server_os":                        server_info["os"],
+        "server_platform":                  server_info["platform"],
+        "session_started_at":               datetime.fromtimestamp(_start_time, timezone.utc).isoformat(),
+        "session_uptime_seconds":            uptime_seconds,
         "stop_time":                         stop_at.isoformat() if stop_at else None,
-        "avg_embeddings_per_hour":           round(avg_hour, 2),
-        "avg_embeddings_per_minute":         round(avg_min, 2),
-        "avg_embeddings_last_hour":          recent_hour,
-        "avg_embeddings_last_hour_per_minute": round(recent_hour / 60, 2),
-        "cores_total":                       cpu_info["cores_total"],
-        "cores_active":                      cpu_info["cores_active"],
+        "status_interval":                   STATUS_INTERVAL,
         "next_status_in_seconds":            next_status_in_seconds,
         "next_status_at":                    next_status_at,
+        "avg_embeddings_per_hour":           round(avg_hour, 2),
+        "avg_embeddings_per_minute":         round(avg_min, 2),
+        "embeddings_last_hour":              recent_hour,
+        "embeddings_last_hour_per_minute":   round(recent_hour / 60, 2),
+        "cores_logical":                     cpu_info["cores_logical"],
+        "cores_physical":                    cpu_info["cores_physical"],
+        "cores_allowed":                     cpu_info["cores_allowed"],
+        "cores_active":                      cpu_info["cores_active"],
+        "cpu_percent":                       cpu_info["cpu_percent"],
+        "load_average_1m":                   cpu_info["load_average_1m"],
+        "load_average_5m":                   cpu_info["load_average_5m"],
+        "load_average_15m":                  cpu_info["load_average_15m"],
+        "memory_total_bytes":                memory_info["total_bytes"],
+        "memory_available_bytes":            memory_info["available_bytes"],
+        "memory_used_percent":               memory_info["used_percent"],
     }
     try:
         resp = requests.post(
