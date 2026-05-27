@@ -1,5 +1,5 @@
 # ============================================================
-#  Embedding Worker — docker-compose
+#  Embedding Worker — docker-compose (base / CPU)
 #
 #  Usage:
 #    CPU only:
@@ -13,13 +13,21 @@
 #
 #  Build first:
 #      docker compose build
-# ======================================
+#
+#  WARNING: Switching between CPU/GPU modes requires a full reinstall.
+#           Run install.sh again to rebuild from scratch.
+# ============================================================
 services:
   embedding-worker:
-    build: .
-    image: embedding-worker:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    image: embedding-worker:cpu
     container_name: ${NODE_NAME:-embedding-worker}
     restart: on-failure
+    security_opt:
+      - apparmor:unconfined
+      - seccomp:unconfined
     volumes:
       - /home/model:/root/.cache/huggingface
     env_file:

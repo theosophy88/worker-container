@@ -347,17 +347,9 @@ def load_model(device: str):
         model_kwargs["torch_dtype"] = torch.float16
     elif PRECISION == "float32":
         model_kwargs["torch_dtype"] = torch.float32
-    elif PRECISION == "8bit":
-        model_kwargs["load_in_8bit"] = True
-    elif PRECISION == "4bit":
-        model_kwargs["load_in_4bit"] = True
     else:
         log.warning(f"Unknown PRECISION '{PRECISION}' — defaulting to float16")
         model_kwargs["torch_dtype"] = torch.float16
-
-    if PRECISION in ("8bit", "4bit") and device == "cpu":
-        log.warning(f"{PRECISION} quantization not supported on CPU — falling back to float32")
-        model_kwargs = {"torch_dtype": torch.float32}
 
     log.info(f"Loading '{HF_MODEL_NAME}' (precision={PRECISION}, device={device})...")
     model = SentenceTransformer(

@@ -504,9 +504,15 @@ draw_header() {
 }
 
 draw_controls() {
+    local _cm; _cm=$(env_get "COMPUTE_MODE" "cpu")
     echo ""
-    echo -e "  ${BOLD}[+]${NC} +1 core  ${BOLD}[-]${NC} -1 core  ${BOLD}[C]${NC} CPU menu  \
+    if [[ "$_cm" == "cpu" ]]; then
+        echo -e "  ${BOLD}[+]${NC} +1 core  ${BOLD}[-]${NC} -1 core  ${BOLD}[C]${NC} CPU menu  \
 ${BOLD}[X]${NC} cancel schedule  ${BOLD}[Q]${NC} quit"
+    else
+        echo -e "  ${BOLD}[Q]${NC} quit  ${BOLD}[R]${NC} refresh"
+        echo -e "  ${DIM}CPU core pinning disabled — worker is GPU-bound (COMPUTE_MODE=${_cm})${NC}"
+    fi
     echo -e "  ${DIM}Auto-refreshes every 5s — press a key at any time${NC}"
 }
 
@@ -535,12 +541,13 @@ func_monitor() {
         draw_controls
 
         local key=""
+        local _cm; _cm=$(env_get "COMPUTE_MODE" "cpu")
         if read -t "$REFRESH_SECS" -n 1 -r key 2>/dev/null; then
             case "$key" in
-                +|=)  quick_cpu_adjust +1 ;;
-                -)    quick_cpu_adjust -1 ;;
-                c|C)  stty echo 2>/dev/null; cpu_menu_interactive; stty -echo 2>/dev/null || true ;;
-                x|X)  cancel_schedule ;;
+                +|=)  [[ "$_cm" == "cpu" ]] && quick_cpu_adjust +1 ;;
+                -)    [[ "$_cm" == "cpu" ]] && quick_cpu_adjust -1 ;;
+                c|C)  [[ "$_cm" == "cpu" ]] && { stty echo 2>/dev/null; cpu_menu_interactive; stty -echo 2>/dev/null || true; } ;;
+                x|X)  [[ "$_cm" == "cpu" ]] && cancel_schedule ;;
                 q|Q)  break ;;
                 r|R)  ;; # refresh
             esac
@@ -558,6 +565,8 @@ func_menu() {
         clear 2>/dev/null || true
         draw_status
 
+        local _compute_mode; _compute_mode=$(env_get "COMPUTE_MODE" "cpu")
+
         echo -e "  ${BOLD}Actions:${NC}"
         echo ""
 
@@ -567,7 +576,7 @@ func_menu() {
             echo "    [2]  Force kill      (stop immediately)"
             echo "    [3]  View live logs"
             echo "    [4]  Restart         (graceful stop → start)"
-            echo "    [M]  Live monitor    (with CPU controls & real-time stats)"
+            echo "    [M]  Live monitor    (with real-time stats)"
         else
             echo -e "  ${BOLD}Worker control:${NC}"
             echo "    [1]  Start worker"
@@ -579,7 +588,11 @@ func_menu() {
 
         echo ""
         echo -e "  ${BOLD}Configuration (some changes apply after-cycle):${NC}"
-        echo "    [5]  Change CPU cores"
+        if [[ "$_compute_mode" == "cpu" ]]; then
+            echo "    [5]  Change CPU cores"
+        else
+            echo -e "    ${DIM}[5]  CPU core pinning N/A — GPU mode (COMPUTE_MODE=${_compute_mode})${NC}"
+        fi
         echo "    [6]  Change batch size   (current: $(env_get BATCH_SIZE 2))"
         echo "    [7]  Change cycle delay  (current: $(env_get DELAY_SECONDS 5)s)"
 
@@ -611,7 +624,13 @@ func_menu() {
                     echo -ne "  Press Enter to continue..."; read -r
                 fi ;;
             m) if is_running; then func_monitor; else err "Worker not running"; sleep 2; fi ;;
-            5) func_cpu; echo -ne "  Press Enter to continue..."; read -r ;;
+            5)
+                if [[ "$_compute_mode" == "cpu" ]]; then
+                    func_cpu; echo -ne "  Press Enter to continue..."; read -r
+                else
+                    warn "CPU core pinning is only available in CPU mode (COMPUTE_MODE=${_compute_mode})"
+                    echo -ne "  Press Enter to continue..."; read -r
+                fi ;;
             6) func_batch; echo -ne "  Press Enter to continue..."; read -r ;;
             7) func_delay; echo -ne "  Press Enter to continue..."; read -r ;;
             8) func_discard_pending; sleep 1 ;;

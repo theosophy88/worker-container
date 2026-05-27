@@ -1,8 +1,12 @@
-# NVIDIA GPU override
+# NVIDIA GPU overlay — PyTorch cu121
 # Usage: docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up
 
 services:
   embedding-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.nvidia
+    image: embedding-worker:nvidia
     deploy:
       resources:
         reservations:

@@ -453,6 +453,18 @@ _apply_lxc_fix() {
 EOF
     export DOCKER_BUILDKIT=0
     ok "LXC Docker fix applied (/etc/docker/daemon.json)"
+    echo ""
+    warn "──────────────────────────────────────────────────────────────"
+    warn "  PROXMOX HOST ACTION REQUIRED"
+    warn "  On the Proxmox host, add these lines to your LXC config:"
+    warn "  (usually /etc/pve/lxc/<CTID>.conf)"
+    warn ""
+    warn "    lxc.apparmor.profile: unconfined"
+    warn "    lxc.cap.drop:"
+    warn ""
+    warn "  Without this, Docker builds will still fail with AppArmor."
+    warn "──────────────────────────────────────────────────────────────"
+    echo ""
 }
 
 _docker_install_debian() {
@@ -568,13 +580,13 @@ _install_compose_standalone() {
 create_worker_files() {
     hdr "Creating Worker Files in ${WORKER_DIR}"
 
-    # ── Dockerfile ────────────────────────────────────────────────────────────
-    cat > "${WORKER_DIR}/Dockerfile" <<'DOCKERFILE'
+    # ── Dockerfiles (one per compute type) ───────────────────────────────────
+    cat > "${WORKER_DIR}/Dockerfile.cpu" <<'DOCKERFILE'
 FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl git && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir \
-    torch sentence-transformers accelerate bitsandbytes requests
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir sentence-transformers accelerate requests psutil
 ENV HF_HOME=/root/.cache/huggingface
 WORKDIR /app
 COPY worker.py .
@@ -582,7 +594,41 @@ COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
 ENTRYPOINT ["/app/entrypoint.sh"]
 DOCKERFILE
-    ok "Dockerfile"
+    ok "Dockerfile.cpu"
+
+    cat > "${WORKER_DIR}/Dockerfile.nvidia" <<'DOCKERFILE'
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl git && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir torch==2.6.0+cu121 --index-url https://download.pytorch.org/whl/cu121
+RUN pip install --no-cache-dir sentence-transformers accelerate requests psutil
+ENV HF_HOME=/root/.cache/huggingface
+WORKDIR /app
+COPY worker.py .
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
+ENTRYPOINT ["/app/entrypoint.sh"]
+DOCKERFILE
+    ok "Dockerfile.nvidia"
+
+    cat > "${WORKER_DIR}/Dockerfile.amd" <<'DOCKERFILE'
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl git && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir torch==2.6.0+rocm6.1 --index-url https://download.pytorch.org/whl/rocm6.1
+RUN pip install --no-cache-dir sentence-transformers accelerate requests psutil
+ENV HF_HOME=/root/.cache/huggingface
+WORKDIR /app
+COPY worker.py .
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
+ENTRYPOINT ["/app/entrypoint.sh"]
+DOCKERFILE
+    ok "Dockerfile.amd"
+
+    # Default Dockerfile = CPU version
+    cp "${WORKER_DIR}/Dockerfile.cpu" "${WORKER_DIR}/Dockerfile"
+    ok "Dockerfile (CPU default)"
 
     # ── entrypoint.sh ─────────────────────────────────────────────────────────
     cat > "${WORKER_DIR}/entrypoint.sh" <<'ENTRYPT'
@@ -590,12 +636,39 @@ DOCKERFILE
 set -e
 HF_MODEL="${HF_MODEL_NAME:-Qwen/Qwen3-Embedding-8B}"
 PRECISION="${PRECISION:-float16}"
+COMPUTE_MODE="${COMPUTE_MODE:-cpu}"
 echo "========================================"
 echo "  Embedding Worker Starting"
 echo "  Node     : ${NODE_NAME:-worker}"
 echo "  Model    : $HF_MODEL"
 echo "  Precision: $PRECISION"
+echo "  Compute  : $COMPUTE_MODE"
 echo "========================================"
+
+_MIN_GPU_MB=16000
+_MIN_CPU_MB=18000
+
+if [[ "$COMPUTE_MODE" == "nvidia" ]] && command -v nvidia-smi &>/dev/null; then
+    _vram_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || echo "")
+    if [[ -n "$_vram_mb" ]] && [[ "$_vram_mb" =~ ^[0-9]+$ ]]; then
+        if [[ "$_vram_mb" -lt "$_MIN_GPU_MB" ]]; then
+            echo "WARNING: GPU VRAM ${_vram_mb}MB < ${_MIN_GPU_MB}MB minimum for float16"
+        else
+            echo "[preflight] GPU VRAM: ${_vram_mb}MB  OK"
+        fi
+    fi
+elif [[ "$COMPUTE_MODE" == "cpu" ]]; then
+    _ram_mb=$(awk '/MemTotal/ { printf "%.0f", $2/1024 }' /proc/meminfo 2>/dev/null || echo "")
+    if [[ -n "$_ram_mb" ]] && [[ "$_ram_mb" =~ ^[0-9]+$ ]]; then
+        if [[ "$_ram_mb" -lt "$_MIN_CPU_MB" ]]; then
+            echo "WARNING: System RAM ${_ram_mb}MB < ${_MIN_CPU_MB}MB minimum for CPU float16"
+            echo "WARNING: Worker may OOM. Consider a machine with >=18GB RAM."
+        else
+            echo "[preflight] System RAM: ${_ram_mb}MB  OK"
+        fi
+    fi
+fi
+
 echo "[startup] Starting embedding worker..."
 exec python3 /app/worker.py
 ENTRYPT
@@ -799,13 +872,19 @@ if __name__ == "__main__":
 WORKERPY
     ok "worker.py"
 
-    # ── docker-compose.yml ────────────────────────────────────────────────────
+    # ── docker-compose.yml (base / CPU) ──────────────────────────────────────
     cat > "${WORKER_DIR}/docker-compose.yml" <<'DCOMPOSE'
 services:
   embedding-worker:
     container_name: embedding-worker
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    image: embedding-worker:cpu
     restart: "${RESTART_POLICY:-on-failure}"
+    security_opt:
+      - apparmor:unconfined
+      - seccomp:unconfined
     volumes:
       - /home/model:/root/.cache/huggingface
     environment:
@@ -813,6 +892,7 @@ services:
       - HF_MODEL_NAME=${HF_MODEL_NAME:-Qwen/Qwen3-Embedding-8B}
       - HF_HOME=/root/.cache/huggingface
       - PRECISION=${PRECISION:-float16}
+      - COMPUTE_MODE=${COMPUTE_MODE:-cpu}
       - N8N_GET_URL=${N8N_GET_URL}
       - N8N_SAVE_URL=${N8N_SAVE_URL}
       - N8N_API_KEY=${N8N_API_KEY}
@@ -826,8 +906,14 @@ DCOMPOSE
     ok "docker-compose.yml"
 
     cat > "${WORKER_DIR}/docker-compose.nvidia.yml" <<'DCNV'
+# NVIDIA GPU overlay — PyTorch cu121
+# Usage: docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up
 services:
   embedding-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.nvidia
+    image: embedding-worker:nvidia
     deploy:
       resources:
         reservations:
@@ -838,15 +924,22 @@ services:
 DCNV
     ok "docker-compose.nvidia.yml"
 
+    # AMD overlay written with placeholder GIDs — patched later by write_config()
     cat > "${WORKER_DIR}/docker-compose.amd.yml" <<'DCAMD'
+# AMD GPU (ROCm) overlay — PyTorch rocm6.1
+# Usage: docker compose -f docker-compose.yml -f docker-compose.amd.yml up
 services:
   embedding-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.amd
+    image: embedding-worker:amd
     devices:
       - /dev/kfd:/dev/kfd
       - /dev/dri:/dev/dri
     group_add:
-      - video
-      - render
+      - "RENDER_GID_PLACEHOLDER"
+      - "VIDEO_GID_PLACEHOLDER"
     environment:
       - HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION:-}
       - ROCR_VISIBLE_DEVICES=0
@@ -862,31 +955,45 @@ DCAMD
 # ── Compute/precision configuration ───────────────────────────────────────────
 # HuggingFace sentence-transformers loads the full model in-process.
 # Device is auto-detected at runtime: CUDA → ROCm → MPS → CPU.
-# This installer uses float16 only:
-#   float16 — half precision (CPU requires >=16 GB RAM, GPU requires >=16 GB VRAM)
+# Precision: float16 only (float32 available as CPU fallback).
 # ──────────────────────────────────────────────────────────────────────────────
 COMPUTE_MODE="" GPU_TYPE="" PRECISION="float16" HSA_OVERRIDE=""
+RENDER_GID="" VIDEO_GID=""
 
 configure_compute() {
     hdr "Compute Mode — HuggingFace / sentence-transformers"
     echo ""
-    echo -e "  ${BOLD}Device auto-detected at runtime (CUDA → ROCm → MPS → CPU).${NC}"
-    echo -e "  ${BOLD}This installer configures float16 only.${NC}"
+    echo -e "  ${BOLD}Choose the compute type for this machine:${NC}"
     echo ""
-    echo "    [1]  CPU float16   — requires >=16 GB RAM"
-    echo "    [2]  GPU float16   — requires >=16 GB VRAM"
+    echo "    [1]  CPU only   — plain PyTorch, requires >=18 GB RAM"
+    echo "    [2]  NVIDIA GPU — PyTorch CUDA 12.1, requires >=16 GB VRAM"
+    echo "    [3]  AMD GPU    — PyTorch ROCm 6.1,  requires >=16 GB VRAM"
     echo ""
-    ask "Target device" "2"
+    echo -e "  ${Y}⚠  Switching between CPU/GPU modes requires a full reinstall.${NC}"
+    echo -e "  ${DIM}  Run install.sh again to rebuild the Docker image from scratch.${NC}"
+    echo ""
+    ask "Compute type" "1"
 
     case "$REPLY" in
         1)
             COMPUTE_MODE="cpu"
+            GPU_TYPE=""
             PRECISION="float16"
             ;;
         2)
-            COMPUTE_MODE="gpu"
+            COMPUTE_MODE="nvidia"
+            GPU_TYPE="nvidia"
             PRECISION="float16"
-            _ask_gpu_type
+            ;;
+        3)
+            COMPUTE_MODE="amd"
+            GPU_TYPE="amd"
+            PRECISION="float16"
+            echo ""
+            echo -e "  ${DIM}AMD RDNA3/RDNA4 (gfx1100/gfx1150) may need GFX version override${NC}"
+            ask "HSA_OVERRIDE_GFX_VERSION (e.g. 11.0.0, blank to skip)" ""
+            HSA_OVERRIDE="$REPLY"
+            _detect_amd_gids
             ;;
         *)
             die "Invalid choice" ;;
@@ -895,23 +1002,24 @@ configure_compute() {
     ok "Compute: ${COMPUTE_MODE} | Precision: ${PRECISION}"
 }
 
-_ask_gpu_type() {
-    echo ""
-    echo "    GPU type:"
-    echo "      [1]  NVIDIA  (CUDA)"
-    echo "      [2]  AMD     (ROCm / HIP)"
-    ask "GPU type" "1"
-    case "$REPLY" in
-        1) GPU_TYPE="nvidia" ;;
-        2)
-            GPU_TYPE="amd"
-            echo ""
-            echo -e "  ${DIM}AMD RDNA3/RDNA4 (gfx1100/gfx1150) may need GFX version override${NC}"
-            ask "HSA_OVERRIDE_GFX_VERSION (e.g. 11.0.0, blank to skip)" ""
-            HSA_OVERRIDE="$REPLY"
-            ;;
-        *) die "Invalid GPU choice" ;;
-    esac
+_detect_amd_gids() {
+    info "Detecting AMD render/video group GIDs from host..."
+    local rg vg
+    rg=$(getent group render 2>/dev/null | cut -d: -f3 || echo "")
+    vg=$(getent group video  2>/dev/null | cut -d: -f3 || echo "")
+
+    if [[ -z "$rg" ]]; then
+        warn "Could not detect 'render' group — using GID 993 (common default)"
+        rg="993"
+    fi
+    if [[ -z "$vg" ]]; then
+        warn "Could not detect 'video' group — using GID 44 (common default)"
+        vg="44"
+    fi
+
+    RENDER_GID="$rg"
+    VIDEO_GID="$vg"
+    ok "AMD GIDs — render: ${RENDER_GID}  video: ${VIDEO_GID}"
 }
 
 # ── Worker Q&A ────────────────────────────────────────────────────────────────
@@ -960,6 +1068,7 @@ configure_worker() {
     # Suggest batch size based on compute mode
     local default_batch=10
     [[ "$COMPUTE_MODE" == "cpu" ]] && default_batch=2
+    [[ "$COMPUTE_MODE" == "nvidia" || "$COMPUTE_MODE" == "amd" ]] && default_batch=10
     echo ""
     echo -e "  ${DIM}Recommended batch size: CPU=2–5  GPU=10–50${NC}"
     ask "Batch size" "$default_batch"
@@ -1012,7 +1121,9 @@ HF_MODEL_NAME=${HF_MODEL_NAME}
 HF_HOME=/root/.cache/huggingface
 
 # ── Precision / compute ───────────────────────────────────────────────────────
-# PRECISION: float16 | float32 | 8bit | 4bit
+# PRECISION: float16 (default) | float32 (CPU fallback)
+# COMPUTE_MODE: cpu | nvidia | amd  — set by installer, do NOT change manually
+#               Changing requires a full reinstall (run install.sh again)
 PRECISION=${PRECISION}
 COMPUTE_MODE=${COMPUTE_MODE}
 GPU_TYPE=${GPU_TYPE}
@@ -1028,22 +1139,11 @@ RESTART_POLICY=${restart_policy}
 EOF
     ok ".env written to ${WORKER_DIR}/.env"
 
-    # Patch docker-compose.yml — add container_name so manage.sh can find it
-    local compose_file="${WORKER_DIR}/docker-compose.yml"
-    if [[ -f "$compose_file" ]]; then
-        if ! grep -q "container_name:" "$compose_file"; then
-            # Insert container_name on the line after 'image:' or 'build:'
-            sed -i '/^\s*\(image:\|build:\)/{
-                /container_name/!{
-                    i\    container_name: embedding-worker
-                }
-            }' "$compose_file" 2>/dev/null || true
-            ok "docker-compose.yml: added container_name: embedding-worker"
-        else
-            ok "docker-compose.yml: container_name already set"
-        fi
-    else
-        warn "docker-compose.yml not found in ${WORKER_DIR} — skipping patch"
+    # For AMD: patch docker-compose.amd.yml with real GIDs detected at install time
+    if [[ "$GPU_TYPE" == "amd" && -f "${WORKER_DIR}/docker-compose.amd.yml" ]]; then
+        sed -i "s/RENDER_GID_PLACEHOLDER/${RENDER_GID}/g" "${WORKER_DIR}/docker-compose.amd.yml"
+        sed -i "s/VIDEO_GID_PLACEHOLDER/${VIDEO_GID}/g"  "${WORKER_DIR}/docker-compose.amd.yml"
+        ok "docker-compose.amd.yml: GIDs set — render=${RENDER_GID}, video=${VIDEO_GID}"
     fi
 }
 
@@ -1052,16 +1152,15 @@ build_and_start() {
     hdr "Building & Starting Worker"
     cd "$WORKER_DIR"
 
-    # Pick compose override for GPU
+    # Pick compose overlay based on COMPUTE_MODE
     local compose_args="-f docker-compose.yml"
-    if [[ "$COMPUTE_MODE" != "cpu" ]]; then
-        case "$GPU_TYPE" in
-            nvidia) [[ -f docker-compose.nvidia.yml ]] && \
-                    compose_args+=" -f docker-compose.nvidia.yml" ;;
-            amd)    [[ -f docker-compose.amd.yml ]] && \
-                    compose_args+=" -f docker-compose.amd.yml" ;;
-        esac
-    fi
+    case "$COMPUTE_MODE" in
+        nvidia) [[ -f docker-compose.nvidia.yml ]] && \
+                compose_args+=" -f docker-compose.nvidia.yml" ;;
+        amd)    [[ -f docker-compose.amd.yml ]] && \
+                compose_args+=" -f docker-compose.amd.yml" ;;
+        cpu)    ;; # base compose only
+    esac
 
     info "Building image (first run downloads model from HuggingFace — may take 10–30 min)..."
     if is_lxc || [[ "${DOCKER_BUILDKIT:-1}" == "0" ]]; then
@@ -1263,20 +1362,31 @@ main() {
     hdr "✓  Installation Complete"
     echo ""
     echo -e "  ${G}${BOLD}Worker '${CONTAINER_NAME}' is running!${NC}"
+    echo -e "  ${BOLD}Compute mode: ${COMPUTE_MODE}${NC}"
     echo ""
     echo -e "  ${BOLD}Quick commands:${NC}"
     echo "    docker logs -f ${CONTAINER_NAME}       ← live logs"
     echo "    docker ps                              ← container status"
     echo ""
-    echo -e "  ${BOLD}CPU management (works while worker is running):${NC}"
-    echo "    bash manage.sh                         ← interactive monitor & menu"
-    echo "    bash manage.sh logs                    ← live log view + CPU controls"
-    echo "    bash manage.sh cpu 4                   ← set 4 cores permanently"
-    echo "    bash manage.sh cpu 4 8h                ← set 4 cores for 8 hours"
-    echo "    bash manage.sh cpu max                 ← restore all cores"
-    echo "    bash manage.sh cancel                  ← cancel scheduled revert"
+    if [[ "$COMPUTE_MODE" == "cpu" ]]; then
+        echo -e "  ${BOLD}CPU management (works while worker is running):${NC}"
+        echo "    bash admin.sh                          ← interactive monitor & menu"
+        echo "    bash admin.sh log                      ← live log view + CPU controls"
+        echo "    bash admin.sh cpu 4                    ← set 4 cores permanently"
+        echo "    bash admin.sh cpu 4 8h                 ← set 4 cores for 8 hours"
+        echo "    bash admin.sh cpu max                  ← restore all cores"
+        echo ""
+        echo -e "  ${DIM}In log view: [+] add 1 core  [-] remove 1 core  [C] full CPU menu${NC}"
+    else
+        echo -e "  ${BOLD}Admin panel:${NC}"
+        echo "    bash admin.sh                          ← interactive monitor & menu"
+        echo "    bash admin.sh log                      ← live log view"
+        echo "    bash admin.sh status                   ← show status panel"
+        echo -e "  ${DIM}CPU core pinning is disabled in GPU mode.${NC}"
+    fi
     echo ""
-    echo -e "  ${DIM}In log view: [+] add 1 core  [-] remove 1 core  [C] full CPU menu${NC}"
+    echo -e "  ${Y}${BOLD}⚠  To switch between CPU/GPU modes you must run install.sh again.${NC}"
+    echo -e "  ${Y}   This will rebuild the Docker image from scratch.${NC}"
     echo ""
 }
 

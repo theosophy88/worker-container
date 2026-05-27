@@ -1,13 +1,25 @@
-# AMD GPU (ROCm) override
+# AMD GPU (ROCm) overlay — PyTorch rocm6.1
 # Usage: docker compose -f docker-compose.yml -f docker-compose.amd.yml up
+#
+# IMPORTANT: group_add must use numeric GIDs — group names don't exist inside
+# python:3.11-slim. The installer (install.sh) detects and writes the correct
+# GIDs at install time. To find them manually on the host:
+#   getent group render | cut -d: -f3
+#   getent group video  | cut -d: -f3
 
 services:
   embedding-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.amd
+    image: embedding-worker:amd
     devices:
       - /dev/kfd:/dev/kfd
       - /dev/dri:/dev/dri
     group_add:
-      - video
-      - render
+      - "993"   # render GID — overwritten by install.sh with host value
+      - "44"    # video GID  — overwritten by install.sh with host value
     environment:
-      - HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION:-}   # e.g. 11.0.0 for gfx1150
+      - HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION:-}
+      - ROCR_VISIBLE_DEVICES=0
+      - HIP_VISIBLE_DEVICES=0

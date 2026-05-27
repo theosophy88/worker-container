@@ -4,8 +4,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install CPU-only PyTorch FIRST — prevents sentence-transformers from pulling a CUDA build
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+# Install PyTorch with CUDA 12.1 support FIRST — must precede sentence-transformers
+RUN pip install --no-cache-dir torch==2.6.0+cu121 --index-url https://download.pytorch.org/whl/cu121
 
 # Install remaining packages after torch is pinned
 RUN pip install --no-cache-dir \
